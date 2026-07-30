@@ -1,0 +1,42 @@
+{
+  "name": "securestore",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hostable shared credential storage and policy platform for multi-agent MCP, REST, and automation clients.",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "mcp:stdio": "tsx src/mcp/stdioMain.ts",
+    "migrate": "tsx src/db/migrate.ts",
+    "seed": "tsx src/scripts/seed.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "fastify": "^4.28.1",
+    "@fastify/cors": "^9.0.1",
+    "pg": "^8.13.0",
+    "zod": "^3.23.8",
+    "jsonwebtoken": "^9.0.2",
+    "jose": "^5.9.6",
+    "pino": "^9.5.0",
+    "uuid": "^9.0.1",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^20.14.0",
+    "@types/pg": "^8.11.10",
+    "@types/uuid": "^9.0.8",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  }
+}
