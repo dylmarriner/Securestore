@@ -375,13 +375,22 @@ parameter (verified live against a mock authorization server, including
 the device flow's `authorization_pending` → `authorization_pending` →
 success polling sequence); `secret_transfer_ownership`, gated to the
 current owner or an admin-capable agent, distinct from `secret_share`
-(which changes visibility, not accountability).
+(which changes visibility, not accountability); `AwsKmsKeyProvider`
+(`KMS_PROVIDER=aws-kms`), wrapping/unwrapping DEKs via AWS KMS `Encrypt`/
+`Decrypt` against a single CMK rather than `LocalKeyProvider`'s env-var
+key — verified live against a mocked AWS KMS API (moto): the full
+envelope-encryption round-trip (generate DEK, AES-256-GCM-encrypt a
+secret, wrap the DEK via KMS, unwrap it, decrypt the secret) succeeds, and
+a tampered ciphertext blob is correctly rejected by KMS with
+`InvalidCiphertextException`; also covered by a mocked-client unit test
+(`test/awsKms.test.ts`) so it stays exercised in CI without an AWS
+dependency.
 
 **Extension points, deliberately not bundled**:
 
 | Area | Current state | Production seam |
 |---|---|---|
-| KMS/HSM | `LocalKeyProvider` (env-var-derived key) | Implement `KeyProvider` (`src/crypto/kms.ts`) against AWS KMS / GCP KMS / Vault Transit / PKCS#11 |
+| KMS/HSM | `LocalKeyProvider` (env-var-derived key) and `AwsKmsKeyProvider` (`src/crypto/kms.ts`, wraps/unwraps DEKs via KMS `Encrypt`/`Decrypt` against a single CMK, `KMS_PROVIDER=aws-kms` + `AWS_KMS_KEY_ID`) are both implemented | For GCP KMS / Vault Transit / PKCS#11, implement `KeyProvider` the same way `AwsKmsKeyProvider` does and register it in `getKeyProvider()` |
 | mTLS, OIDC | Implemented — see §6a below | — |
 | Workload identity, passkeys, hardware-backed client keys | `agents.auth_method`/`auth_identifier` columns are generic enough to carry these too, but no verification strategy is wired for them yet | Add a strategy alongside mTLS/OIDC in `src/auth/resolveAgent.ts`; the agent identity model doesn't need to change |
 | gRPC | Not implemented | Tool handlers in `toolHandlers.ts` are already transport-agnostic; add a `.proto` + server wrapping the same functions, same pattern as the REST mirror |
