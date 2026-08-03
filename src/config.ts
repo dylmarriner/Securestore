@@ -30,11 +30,37 @@ export const config = {
   },
   auth: {
     apiKeyPepperB64: process.env.SECURESTORE_APIKEY_PEPPER,
-    jwtIssuer: process.env.SECURESTORE_JWT_ISSUER ?? "securestore",
-    jwtAudience: process.env.SECURESTORE_JWT_AUDIENCE ?? "securestore-mcp",
     adminBootstrapToken: process.env.SECURESTORE_ADMIN_BOOTSTRAP_TOKEN,
+  },
+  // OIDC bearer-token auth: an agent registered with auth_method='oidc' and
+  // auth_identifier=<expected `sub` claim> authenticates by presenting a
+  // JWT from this issuer instead of a SecureStore API key. Optional — only
+  // consulted when these are set AND a request's Authorization header
+  // fails to match a known API key.
+  oidc: {
+    issuer: process.env.SECURESTORE_OIDC_ISSUER,
+    jwksUri: process.env.SECURESTORE_OIDC_JWKS_URI,
+    audience: process.env.SECURESTORE_OIDC_AUDIENCE,
+  },
+  // mTLS auth: an agent registered with auth_method='mtls' and
+  // auth_identifier=<client certificate SHA-256 fingerprint>
+  // authenticates by presenting that certificate during the TLS
+  // handshake. Optional — only active when all three paths are set, which
+  // also switches the HTTP listener from plain HTTP to HTTPS.
+  mtls: {
+    certPath: process.env.SECURESTORE_TLS_CERT_PATH,
+    keyPath: process.env.SECURESTORE_TLS_KEY_PATH,
+    caPath: process.env.SECURESTORE_TLS_CA_PATH,
+    requireClientCert: process.env.SECURESTORE_MTLS_REQUIRE === "1",
   },
   rateLimit: {
     defaultPerMinute: Number(process.env.SECURESTORE_DEFAULT_RATE_PER_MIN ?? 120),
+  },
+  // Optional: when set, rate limiting and proxy/temporary-issue sessions
+  // are backed by Redis instead of per-process memory, giving exact
+  // (not per-replica-approximate) behavior across a horizontally scaled
+  // deployment. See src/services/redisClient.ts.
+  redis: {
+    url: process.env.REDIS_URL,
   },
 };

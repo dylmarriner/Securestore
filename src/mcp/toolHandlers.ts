@@ -3,14 +3,18 @@ import { checkPolicy, recordAccessDenied, createApprovalRequest, decideApproval,
 import {
   findCredentials, getCredential, revealSecret, revealSecretForBrokeredUse,
   updateMetadata, revokeCredential, deleteCredential, claimCredential, shareCredential,
-  markValidation, storeCredential,
+  markValidation, storeCredential, transferOwnership, type TransferOwnershipInput,
 } from "../services/credentialService.js";
 import { ingestDetectedCredential, type IngestInput } from "../services/ingestionPipeline.js";
 import { adapterRegistry } from "../adapters/registry.js";
 import { queryAudit } from "../services/auditService.js";
-import { registerAgent, listSessions, getAgent } from "../services/agentService.js";
+import { registerAgent, listSessions, getAgent, getAgentWorkspaceIds } from "../services/agentService.js";
+import { assertCredentialVisible, VisibilityError } from "../services/visibilityService.js";
 import { proxySessionStore } from "../services/proxySessionStore.js";
-import { buildAuthorizationUrl, exchangeAuthorizationCode, refreshAccessToken, storeOAuthTokens } from "../services/oauthService.js";
+import {
+  buildAuthorizationUrl, exchangeAuthorizationCode, refreshAccessToken, storeOAuthTokens,
+  requestDeviceAuthorization, pollDeviceToken, DeviceAuthorizationPendingError, requestClientCredentialsToken,
+} from "../services/oauthService.js";
 import { eventBus } from "../services/eventBus.js";
 import { pool, withTransaction } from "../db/pool.js";
 import { recordAudit } from "../services/auditService.js";
@@ -24,6 +28,25 @@ export class ToolError extends Error {
 
 function reqCtxOf(ctx: AgentContext) {
   return { transport: ctx.transport, sourceNetwork: ctx.sourceNetwork };
+}
+
+/**
+ * Fetches a credential and enforces org/workspace visibility before any
+ * policy decision is made. Returns `not_found` for both "doesn't exist"
+ * and "exists but you can't see it" so a cross-tenant probe can't
+ * distinguish the two. Every tool handler that operates on a specific
+ * credentialId goes through this instead of calling getCredential directly.
+ */
+async function loadVisibleCredential(ctx: AgentContext, credentialId: string) {
+  const cred = await getCredential(credentialId);
+  if (!cred) throw new ToolError("credential not found", "not_found");
+  try {
+    await assertCredentialVisible(ctx.agent, cred);
+  } catch (err) {
+    if (err instanceof VisibilityError) throw new ToolError("credential not found", "not_found");
+    throw err;
+  }
+  return cred;
 }
 
 function summarize(cred: NonNullable<Awaited<ReturnType<typeof getCredential>>>) {
@@ -54,7 +77,7 @@ async function requirePolicy(
 ) {
   const decision = await checkPolicy(ctx.agent, credential, { ...reqCtxOf(ctx), action });
   if (decision.effect === "deny") {
-    await recordAccessDenied(ctx.agent.id, ctx.workspaceId, credential.id ?? null, action, decision.reason);
+    await recordAccessDenied(ctx.agent.orgId, ctx.agent.id, ctx.workspaceId, credential.id ?? null, action, decision.reason);
     throw new ToolError(`access denied: ${decision.reason}`, "access_denied");
   }
   return decision;
@@ -65,8 +88,7 @@ async function requirePolicy(
 // ---------------------------------------------------------------------------
 
 export async function toolSecretGet(ctx: AgentContext, args: { credentialId: string }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   const decision = await requirePolicy(ctx, "secret_get", cred);
 
   if (decision.requiresApproval) {
@@ -95,19 +117,26 @@ export async function toolSecretFind(ctx: AgentContext, args: {
   provider?: string; credentialType?: string; environment?: string; tags?: string[]; nameQuery?: string; limit?: number;
 }) {
   await requirePolicy(ctx, "secret_find", { id: undefined as any, provider: args.provider ?? "*", credentialType: args.credentialType ?? "*", environment: args.environment ?? "development", tags: args.tags ?? [], ownerScope: "workspace", sensitivity: "medium" });
-  const results = await findCredentials({ ...args, workspaceId: ctx.workspaceId ?? undefined });
+  const memberWorkspaceIds = await getAgentWorkspaceIds(ctx.agent.id);
+  const results = await findCredentials({
+    ...args, workspaceId: ctx.workspaceId ?? undefined,
+    visibleTo: { orgId: ctx.agent.orgId, agentId: ctx.agent.id, memberWorkspaceIds },
+  });
   return { credentials: results.map(summarize) };
 }
 
 export async function toolSecretList(ctx: AgentContext, args: { status?: string; limit?: number }) {
   await requirePolicy(ctx, "secret_list", { id: undefined as any, provider: "*", credentialType: "*", environment: "development", tags: [], ownerScope: "workspace", sensitivity: "medium" });
-  const results = await findCredentials({ workspaceId: ctx.workspaceId ?? undefined, status: args.status, limit: args.limit });
+  const memberWorkspaceIds = await getAgentWorkspaceIds(ctx.agent.id);
+  const results = await findCredentials({
+    workspaceId: ctx.workspaceId ?? undefined, status: args.status, limit: args.limit,
+    visibleTo: { orgId: ctx.agent.orgId, agentId: ctx.agent.id, memberWorkspaceIds },
+  });
   return { credentials: results.map(summarize) };
 }
 
 export async function toolSecretMetadata(ctx: AgentContext, args: { credentialId: string }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "secret_metadata", cred);
   return summarize(cred);
 }
@@ -151,8 +180,7 @@ export async function toolSecretStoreDetected(ctx: AgentContext, args: {
 }
 
 export async function toolSecretUpdate(ctx: AgentContext, args: { credentialId: string; name?: string; tags?: string[]; notes?: string; sensitivity?: string; environment?: string }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "secret_update", cred);
   const sets: string[] = [];
   const params: unknown[] = [];
@@ -169,8 +197,7 @@ export async function toolSecretUpdate(ctx: AgentContext, args: { credentialId: 
 }
 
 export async function toolSecretEnrich(ctx: AgentContext, args: { credentialId: string; fields: Record<string, unknown>; verified?: boolean }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   if (!ctx.agent.metadataEnrichmentPermission) throw new ToolError("agent lacks metadata-enrichment permission", "capability_denied");
   await requirePolicy(ctx, "secret_enrich", cred);
   const now = new Date().toISOString();
@@ -183,8 +210,7 @@ export async function toolSecretEnrich(ctx: AgentContext, args: { credentialId: 
 }
 
 export async function toolSecretRotate(ctx: AgentContext, args: { credentialId: string; newSecretValue: string; metadata?: Record<string, unknown> }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "secret_rotate", cred);
   const now = new Date().toISOString();
   const metadata: CredentialMetadata = {
@@ -204,34 +230,55 @@ export async function toolSecretRotate(ctx: AgentContext, args: { credentialId: 
 }
 
 export async function toolSecretRevoke(ctx: AgentContext, args: { credentialId: string; reason?: string }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "secret_revoke", cred);
   await revokeCredential(args.credentialId, ctx.agent.id, args.reason);
   return { credentialId: args.credentialId, status: "revoked" };
 }
 
 export async function toolSecretDelete(ctx: AgentContext, args: { credentialId: string; hard?: boolean }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "secret_delete", cred);
   await deleteCredential(args.credentialId, ctx.agent.id, args.hard);
   return { credentialId: args.credentialId, status: args.hard ? "deleted_permanently" : "deleted" };
 }
 
 export async function toolSecretClaim(ctx: AgentContext, args: { credentialId: string }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "secret_enrich", cred);
   const updated = await claimCredential(args.credentialId, ctx.agent.id);
   return summarize(updated);
 }
 
 export async function toolSecretShare(ctx: AgentContext, args: { credentialId: string; sharingPolicy: Record<string, unknown> }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "secret_share", cred);
   const updated = await shareCredential(args.credentialId, ctx.agent.id, args.sharingPolicy);
+  return summarize(updated);
+}
+
+export async function toolSecretTransferOwnership(ctx: AgentContext, args: TransferOwnershipInput & { credentialId: string }) {
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
+  await requirePolicy(ctx, "secret_share", cred);
+
+  const isCurrentOwner =
+    (cred.ownerAgentId && cred.ownerAgentId === ctx.agent.id) ||
+    (cred.ownerUserId && ctx.agent.ownerUserId && cred.ownerUserId === ctx.agent.ownerUserId);
+  if (!isCurrentOwner && !ctx.agent.metadataAdminPermission) {
+    throw new ToolError("only the current owner or an admin-capable agent may transfer ownership", "capability_denied");
+  }
+
+  if (args.ownerAgentId) {
+    const targetAgent = await getAgent(args.ownerAgentId);
+    if (!targetAgent || targetAgent.orgId !== ctx.agent.orgId) {
+      throw new ToolError("ownerAgentId does not refer to an agent in this org", "bad_request");
+    }
+  }
+
+  const updated = await transferOwnership(args.credentialId, ctx.agent.id, {
+    ownerScope: args.ownerScope, ownerUserId: args.ownerUserId ?? null,
+    ownerAgentId: args.ownerAgentId ?? null, workspaceId: args.workspaceId ?? null,
+  });
   return summarize(updated);
 }
 
@@ -243,16 +290,22 @@ export async function toolCredentialExecute(ctx: AgentContext, args: {
   credentialId?: string; proxyToken?: string; operation: string; params?: Record<string, unknown>;
 }) {
   let credentialId = args.credentialId;
+  let cred: NonNullable<Awaited<ReturnType<typeof getCredential>>>;
   if (args.proxyToken) {
-    const session = proxySessionStore.redeem(args.proxyToken);
+    const session = await proxySessionStore.redeem(args.proxyToken);
     if (!session) throw new ToolError("proxy token invalid or expired", "invalid_proxy_token");
+    // A proxy/temporary token is scoped to the agent it was issued to at
+    // creation time (which already passed visibility + policy checks) —
+    // redemption by a different agent that merely obtained the token
+    // string is rejected rather than implicitly re-granting access.
+    if (session.agentId !== ctx.agent.id) throw new ToolError("proxy token was not issued to this agent", "invalid_proxy_token");
     credentialId = session.credentialId;
-  }
-  if (!credentialId) throw new ToolError("credentialId or proxyToken is required", "bad_request");
-  const cred = await getCredential(credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
-
-  if (!args.proxyToken) {
+    const found = await getCredential(credentialId);
+    if (!found) throw new ToolError("credential not found", "not_found");
+    cred = found;
+  } else {
+    if (!credentialId) throw new ToolError("credentialId or proxyToken is required", "bad_request");
+    cred = await loadVisibleCredential(ctx, credentialId);
     await requirePolicy(ctx, "credential_execute", cred);
   }
 
@@ -269,6 +322,7 @@ export async function toolCredentialExecute(ctx: AgentContext, args: {
     );
     await withTransaction(async (client) => {
       await recordAudit(client, {
+        orgId: cred.orgId,
         agentId: ctx.agent.id, workspaceId: cred.workspaceId, credentialId, provider: cred.provider,
         operation: "credential_execute", accessMode: "brokered", policyDecision: "allow",
         sessionId: ctx.sessionId, mcpTransport: ctx.transport, sourceNetwork: ctx.sourceNetwork,
@@ -286,8 +340,7 @@ export async function toolCredentialExecute(ctx: AgentContext, args: {
 }
 
 export async function toolCredentialValidate(ctx: AgentContext, args: { credentialId: string }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "credential_validate", cred);
   const { secretValue, metadata } = await revealSecretForBrokeredUse(args.credentialId);
   const adapter = adapterRegistry.resolve(cred.provider, cred.credentialType);
@@ -301,11 +354,10 @@ export async function toolCredentialValidate(ctx: AgentContext, args: { credenti
 }
 
 export async function toolCredentialProxySessionCreate(ctx: AgentContext, args: { credentialId: string; ttlSeconds?: number; maxUses?: number }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   const decision = await requirePolicy(ctx, "credential_proxy_session_create", cred);
   const ttl = Math.min(args.ttlSeconds ?? 300, decision.maxSessionSeconds ?? 3600);
-  const session = proxySessionStore.create({
+  const session = await proxySessionStore.create({
     credentialId: cred.id, agentId: ctx.agent.id, workspaceId: ctx.workspaceId,
     usesRemaining: args.maxUses ?? decision.maxRetrievalCount ?? 10, mode: "proxy", ttlSeconds: ttl,
   });
@@ -313,11 +365,10 @@ export async function toolCredentialProxySessionCreate(ctx: AgentContext, args: 
 }
 
 export async function toolCredentialTemporaryIssue(ctx: AgentContext, args: { credentialId: string; ttlSeconds?: number; maxUses?: number }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "credential_temporary_issue", cred);
   const ttl = Math.min(args.ttlSeconds ?? 60, 900);
-  const session = proxySessionStore.create({
+  const session = await proxySessionStore.create({
     credentialId: cred.id, agentId: ctx.agent.id, workspaceId: ctx.workspaceId,
     usesRemaining: args.maxUses ?? 1, mode: "temporary", ttlSeconds: ttl,
   });
@@ -332,19 +383,77 @@ export async function toolCredentialTemporaryIssue(ctx: AgentContext, args: { cr
 // ---------------------------------------------------------------------------
 
 const pendingOAuthState = new Map<string, { codeVerifier: string; clientId: string; clientSecret?: string; redirectUri: string; provider: string; tokenEndpoint: string; refreshEndpoint?: string; authorizationEndpoint: string; revocationEndpoint?: string }>();
+const pendingDeviceFlows = new Map<string, { clientId: string; clientSecret?: string; provider: string; tokenEndpoint: string; refreshEndpoint?: string; name?: string; orgId: string; workspaceId: string | null; introducingAgentId: string }>();
 
 export async function toolOAuthAuthorize(ctx: AgentContext, args: {
-  action: "start" | "complete";
-  provider: string; clientId: string; clientSecret?: string; redirectUri: string; scopes?: string[];
+  action: "start" | "complete" | "device_start" | "device_poll" | "client_credentials";
+  provider: string; clientId: string; clientSecret?: string; redirectUri?: string; scopes?: string[];
   authorizationEndpoint?: string; tokenEndpoint?: string; refreshEndpoint?: string; revocationEndpoint?: string;
+  deviceAuthorizationEndpoint?: string; deviceCode?: string;
   state?: string; code?: string; name?: string;
 }) {
   const adapter = adapterRegistry.get(args.provider);
-  const authorizationEndpoint = args.authorizationEndpoint ?? adapter?.oauth?.authorizationEndpoint;
   const tokenEndpoint = args.tokenEndpoint ?? adapter?.oauth?.tokenEndpoint;
+
+  if (args.action === "client_credentials") {
+    if (!tokenEndpoint) throw new ToolError("tokenEndpoint required (not known for this provider)", "bad_request");
+    if (!args.clientSecret) throw new ToolError("clientSecret is required for the client_credentials grant", "bad_request");
+    const tokens = await requestClientCredentialsToken(tokenEndpoint, {
+      clientId: args.clientId, clientSecret: args.clientSecret, scopes: args.scopes,
+    });
+    const result = await storeOAuthTokens({
+      orgId: ctx.agent.orgId, workspaceId: ctx.workspaceId, provider: args.provider,
+      name: args.name ?? `${args.provider} oauth (client_credentials)`, tokens,
+      endpoints: { tokenEndpoint }, introducingAgentId: ctx.agent.id,
+    });
+    return { status: "stored", credentialId: result.credential.id, created: result.created };
+  }
+
+  if (args.action === "device_start") {
+    const deviceAuthorizationEndpoint = args.deviceAuthorizationEndpoint ?? adapter?.oauth?.authorizationEndpoint;
+    if (!deviceAuthorizationEndpoint || !tokenEndpoint) throw new ToolError("deviceAuthorizationEndpoint/tokenEndpoint required (not known for this provider)", "bad_request");
+    const auth = await requestDeviceAuthorization(deviceAuthorizationEndpoint, { clientId: args.clientId, scopes: args.scopes ?? [] });
+    pendingDeviceFlows.set(auth.device_code, {
+      clientId: args.clientId, clientSecret: args.clientSecret, provider: args.provider, tokenEndpoint,
+      refreshEndpoint: args.refreshEndpoint, name: args.name,
+      orgId: ctx.agent.orgId, workspaceId: ctx.workspaceId, introducingAgentId: ctx.agent.id,
+    });
+    return {
+      status: "device_authorization_created", deviceCode: auth.device_code, userCode: auth.user_code,
+      verificationUri: auth.verification_uri, verificationUriComplete: auth.verification_uri_complete,
+      expiresIn: auth.expires_in, pollIntervalSeconds: auth.interval ?? 5,
+    };
+  }
+
+  if (args.action === "device_poll") {
+    if (!args.deviceCode) throw new ToolError("deviceCode is required", "bad_request");
+    const pending = pendingDeviceFlows.get(args.deviceCode);
+    if (!pending) throw new ToolError("unknown or expired device code", "invalid_state");
+    try {
+      const tokens = await pollDeviceToken(pending.tokenEndpoint, { deviceCode: args.deviceCode, clientId: pending.clientId, clientSecret: pending.clientSecret });
+      pendingDeviceFlows.delete(args.deviceCode);
+      const result = await storeOAuthTokens({
+        orgId: pending.orgId, workspaceId: pending.workspaceId, provider: pending.provider,
+        name: pending.name ?? `${pending.provider} oauth (device)`, tokens,
+        endpoints: { tokenEndpoint: pending.tokenEndpoint, refreshEndpoint: pending.refreshEndpoint },
+        introducingAgentId: pending.introducingAgentId,
+      });
+      return { status: "stored", credentialId: result.credential.id, created: result.created };
+    } catch (err) {
+      if (err instanceof DeviceAuthorizationPendingError) {
+        return { status: "pending", message: "user has not yet approved the device code; poll again after the interval" };
+      }
+      pendingDeviceFlows.delete(args.deviceCode);
+      throw new ToolError(err instanceof Error ? err.message : String(err), "device_flow_failed");
+    }
+  }
+
+  // action === "start" | "complete": authorization-code + PKCE
+  const authorizationEndpoint = args.authorizationEndpoint ?? adapter?.oauth?.authorizationEndpoint;
   if (!authorizationEndpoint || !tokenEndpoint) throw new ToolError("authorizationEndpoint/tokenEndpoint required (not known for this provider)", "bad_request");
 
   if (args.action === "start") {
+    if (!args.redirectUri) throw new ToolError("redirectUri is required to start the authorization-code flow", "bad_request");
     const result = buildAuthorizationUrl({
       authorizationEndpoint, tokenEndpoint, clientId: args.clientId, redirectUri: args.redirectUri, scopes: args.scopes ?? [],
     });
@@ -374,13 +483,16 @@ export async function toolOAuthAuthorize(ctx: AgentContext, args: {
 }
 
 export async function toolOAuthRefresh(ctx: AgentContext, args: { credentialId: string; clientId: string; clientSecret?: string }) {
-  const cred = await getCredential(args.credentialId);
-  if (!cred) throw new ToolError("credential not found", "not_found");
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "oauth_refresh", cred);
   const tokenEndpoint = cred.metadata["tokenEndpoint"]?.value as string | undefined;
   const refreshEndpoint = (cred.metadata["refreshEndpoint"]?.value as string | undefined) ?? tokenEndpoint;
+  // authorizationEndpoint is purely informational provenance for this
+  // credential (not used in the refresh HTTP call itself), so its absence
+  // — expected for tokens issued via the device or client_credentials
+  // grants — doesn't block a refresh.
   const authorizationEndpoint = cred.metadata["authEndpoint"]?.value as string | undefined;
-  if (!tokenEndpoint || !refreshEndpoint || !authorizationEndpoint) throw new ToolError("credential is missing OAuth endpoint metadata required to refresh", "missing_metadata");
+  if (!tokenEndpoint || !refreshEndpoint) throw new ToolError("credential is missing OAuth endpoint metadata required to refresh", "missing_metadata");
 
   const { secretValue } = await revealSecretForBrokeredUse(args.credentialId);
   const parsed = JSON.parse(secretValue) as { refresh_token?: string };
@@ -415,23 +527,33 @@ export async function toolApprovalRequest(ctx: AgentContext, args: {
 }) {
   if (args.action === "create") {
     if (!args.credentialId || !args.operation) throw new ToolError("credentialId and operation are required", "bad_request");
-    const id = await createApprovalRequest(args.credentialId, ctx.agent.id, args.operation);
+    const cred = await loadVisibleCredential(ctx, args.credentialId);
+    const id = await createApprovalRequest(cred.id, ctx.agent.id, args.operation);
     return { approvalId: id, status: "pending" };
   }
   if (args.action === "decide") {
     if (!ctx.agent.metadataAdminPermission) throw new ToolError("agent lacks admin permission required to decide approvals", "capability_denied");
     if (!args.approvalId) throw new ToolError("approvalId is required", "bad_request");
-    const row = await decideApproval(args.approvalId, ctx.agent.id, Boolean(args.approve), args.reason);
+    const row = await decideApproval(ctx.agent.orgId, args.approvalId, ctx.agent.id, Boolean(args.approve), args.reason);
+    if (!row) throw new ToolError("approval request not found", "not_found");
     return row;
   }
   if (!args.approvalId) throw new ToolError("approvalId is required", "bad_request");
-  return getApprovalStatus(args.approvalId);
+  const status = await getApprovalStatus(ctx.agent.orgId, args.approvalId);
+  if (!status) throw new ToolError("approval request not found", "not_found");
+  return status;
 }
 
 export async function toolAuditQuery(ctx: AgentContext, args: { credentialId?: string; agentId?: string; operation?: string; sinceIso?: string; limit?: number }) {
-  await checkPolicy(ctx.agent, { id: undefined as any, provider: "*", credentialType: "*", environment: "development", tags: [], ownerScope: "workspace", sensitivity: "low" }, { ...reqCtxOf(ctx), action: "audit_query" });
+  await requirePolicy(ctx, "audit_query", { id: undefined as any, provider: "*", credentialType: "*", environment: "development", tags: [], ownerScope: "workspace", sensitivity: "low" });
+  const memberWorkspaceIds = await getAgentWorkspaceIds(ctx.agent.id);
+  // Org-wide (workspaceless) audit rows — e.g. agent lifecycle events — are
+  // only surfaced to admin-capable agents; ordinary agents see only the
+  // workspaces they belong to.
   const rows = await queryAudit({
-    workspaceId: ctx.workspaceId ?? undefined, credentialId: args.credentialId, agentId: args.agentId,
+    orgId: ctx.agent.orgId,
+    workspaceScope: { workspaceIds: memberWorkspaceIds, includeWorkspaceless: ctx.agent.metadataAdminPermission },
+    credentialId: args.credentialId, agentId: args.agentId,
     operation: args.operation, since: args.sinceIso ? new Date(args.sinceIso) : undefined, limit: args.limit,
   });
   return { entries: rows };
@@ -453,13 +575,16 @@ export async function toolAgentSessionList(ctx: AgentContext, args: { agentId?: 
     throw new ToolError("agent lacks admin permission required to list another agent's sessions", "capability_denied");
   }
   const target = await getAgent(targetId);
-  if (!target) throw new ToolError("agent not found", "not_found");
+  if (!target || target.orgId !== ctx.agent.orgId) throw new ToolError("agent not found", "not_found");
   const sessions = await listSessions(targetId);
   return { agentId: targetId, sessions };
 }
 
 export async function toolCredentialEventSubscribe(ctx: AgentContext, args: { sinceEventId?: number; eventTypes?: string[] }) {
-  const events = await eventBus.listEventsSince(args.sinceEventId ?? 0, ctx.workspaceId ?? undefined);
+  const memberWorkspaceIds = await getAgentWorkspaceIds(ctx.agent.id);
+  const events = await eventBus.listEventsSince(args.sinceEventId ?? 0, {
+    orgId: ctx.agent.orgId, workspaceIds: memberWorkspaceIds, includeWorkspaceless: ctx.agent.metadataAdminPermission,
+  });
   const filtered = args.eventTypes?.length ? events.filter((e) => args.eventTypes!.includes(e.eventType)) : events;
   return {
     events: filtered,

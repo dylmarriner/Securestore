@@ -78,6 +78,71 @@ export class LocalKeyProvider implements KeyProvider {
   }
 }
 
+/**
+ * Wraps/unwraps DEKs with AWS KMS's `Encrypt`/`Decrypt` operations against
+ * a single customer-managed key (CMK) — not `GenerateDataKey`, since
+ * SecureStore already generates the DEK locally (`src/crypto/envelope.ts`)
+ * and only needs the KMS call to protect that ~32-byte value, well under
+ * KMS's 4KB direct-Encrypt limit.
+ *
+ * `kekVersion` is fixed at 1 and not meaningful for this provider: AWS
+ * KMS's automatic annual key rotation keeps the same `KeyId`/ARN and
+ * transparently retains old backing key material internally, so a
+ * ciphertext blob from before a rotation still decrypts correctly without
+ * SecureStore needing to track a version — the opaque `CiphertextBlob`
+ * itself is self-describing to KMS. A deliberate key *replacement*
+ * (different KeyId/ARN, e.g. moving regions or CMKs) is a different KEK
+ * identity entirely and should be modeled as a new `kekId`, not a new
+ * version of this one.
+ */
+export class AwsKmsKeyProvider implements KeyProvider {
+  readonly kekVersion = 1;
+  private client: import("@aws-sdk/client-kms").KMSClient | undefined;
+
+  constructor(readonly kekId: string) {
+    if (!kekId) {
+      throw new Error("AWS KMS key id/ARN is required (AWS_KMS_KEY_ID)");
+    }
+  }
+
+  private async getClient() {
+    if (!this.client) {
+      const { KMSClient } = await import("@aws-sdk/client-kms");
+      // AWS_KMS_ENDPOINT lets a self-hoster (or this project's own tests)
+      // point at a KMS-compatible endpoint other than the real AWS
+      // service — e.g. a local moto/LocalStack instance — without any
+      // other code change. Region/credentials otherwise come from the
+      // SDK's normal resolution chain (env vars, shared config, IAM role).
+      this.client = new KMSClient({
+        region: process.env.AWS_REGION,
+        endpoint: process.env.AWS_KMS_ENDPOINT,
+      });
+    }
+    return this.client;
+  }
+
+  async wrapKey(dek: Buffer): Promise<Buffer> {
+    const { EncryptCommand } = await import("@aws-sdk/client-kms");
+    const client = await this.getClient();
+    const res = await client.send(new EncryptCommand({ KeyId: this.kekId, Plaintext: dek }));
+    if (!res.CiphertextBlob) throw new Error("AWS KMS Encrypt returned no CiphertextBlob");
+    return Buffer.from(res.CiphertextBlob);
+  }
+
+  async unwrapKey(wrapped: Buffer, kekId: string, kekVersion: number): Promise<Buffer> {
+    if (kekVersion !== this.kekVersion) {
+      throw new Error(`AwsKmsKeyProvider cannot unwrap kekVersion ${kekVersion} (only ${this.kekVersion} is meaningful for this provider)`);
+    }
+    const { DecryptCommand } = await import("@aws-sdk/client-kms");
+    const client = await this.getClient();
+    // KeyId is optional for Decrypt (the ciphertext blob is self-describing)
+    // but pinning it is defense-in-depth against a swapped/mismatched blob.
+    const res = await client.send(new DecryptCommand({ CiphertextBlob: wrapped, KeyId: kekId }));
+    if (!res.Plaintext) throw new Error("AWS KMS Decrypt returned no Plaintext");
+    return Buffer.from(res.Plaintext);
+  }
+}
+
 let activeProvider: KeyProvider | undefined;
 
 export function getKeyProvider(): KeyProvider {
@@ -86,10 +151,15 @@ export function getKeyProvider(): KeyProvider {
     case "local":
       activeProvider = new LocalKeyProvider();
       return activeProvider;
+    case "aws-kms": {
+      const keyId = process.env.AWS_KMS_KEY_ID;
+      if (!keyId) throw new Error("KMS_PROVIDER=aws-kms requires AWS_KMS_KEY_ID (a KMS key id or ARN)");
+      activeProvider = new AwsKmsKeyProvider(keyId);
+      return activeProvider;
+    }
     // Extension points — implement the KeyProvider interface against the
     // target KMS/HSM SDK and register it here. Left unimplemented rather
     // than stubbed-and-silently-insecure, so misconfiguration fails loudly.
-    case "aws-kms":
     case "gcp-kms":
     case "vault-transit":
       throw new Error(

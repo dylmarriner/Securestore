@@ -19,10 +19,12 @@
     "lint": "eslint src --ext .ts"
   },
   "dependencies": {
+    "@aws-sdk/client-kms": "^3.1101.0",
     "@fastify/cors": "^11.3.0",
     "@modelcontextprotocol/sdk": "^1.12.0",
     "dotenv": "^16.4.5",
     "fastify": "^5.11.2",
+    "ioredis": "^6.0.0",
     "jose": "^5.9.6",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.13.0",

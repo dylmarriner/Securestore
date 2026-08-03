@@ -18,7 +18,7 @@ ownership assumption.
 
 **Non-goals for this implementation**: a full enterprise IdP (SSO/SCIM),
 a general-purpose workflow/approval UI, a bundled HSM, or a Rego-compatible
-policy DSL. Each has a clearly marked extension seam (§10) rather than a
+policy DSL. Each has a clearly marked extension seam (§11) rather than a
 half-built version of the real thing.
 
 ## 2. High-level architecture
@@ -93,7 +93,7 @@ choices:
 - **`credentials.metadata` is a JSONB map of `{field: {value, confidence,
   source, verified, updatedAt, introducedByAgentId}}`** — every metadata
   field carries its own provenance, which is what makes the
-  merge-without-clobbering-verified-data rule (§7) possible.
+  merge-without-clobbering-verified-data rule (§8) possible.
 - **`events` is a transactional outbox**: every mutation inserts its event
   row in the same DB transaction, so an event can never be observed for a
   write that rolled back, or dropped for one that committed.
@@ -153,7 +153,86 @@ outside `src/crypto/envelope.ts`'s decrypt call sites.
   `nextSinceEventId` (`credential_event_subscribe`), so a redelivered or
   out-of-order NOTIFY can't cause double-processing.
 
-## 6. Policy engine
+## 6. Multi-tenant isolation
+
+Every credential, audit entry, and event carries an `org_id`; every
+credential additionally carries a `workspace_id` (nullable only for
+explicitly org-wide-shared credentials). Isolation is enforced at three
+points, not just one, because a single missed call site is enough to leak
+across tenants:
+
+1. **Session open** (`openSession` in `src/services/agentService.ts`): a
+   caller cannot select a workspace it isn't a member of via the
+   `X-SecureStore-Workspace-Id` header/session param — membership is
+   checked against `agent_workspace_memberships` before a session (and
+   therefore `ctx.workspaceId`) is issued. This is what makes
+   `ctx.workspaceId` trustworthy everywhere downstream.
+2. **Per-credential visibility** (`src/services/visibilityService.ts`,
+   `assertCredentialVisible`/`loadVisibleCredential`): every tool handler
+   that operates on a specific `credentialId` resolves it through this gate
+   before any policy decision is made. It checks `credential.orgId ===
+   agent.orgId` and then the credential's `sharing_policy.visibility`
+   (`workspace` [default, requires membership] | `organization` [any agent
+   in the org] | `agents` [explicit allow-list] | `private` [owner only]).
+   A cross-tenant or out-of-scope request fails as `not_found`, never
+   `denied` — so it can't be used to confirm a credential's existence.
+3. **Listing/query scoping** (`visibilityWhereClause` in
+   `visibilityService.ts`, reused by `findCredentials`, `queryAudit`, and
+   the event bus's `subscribe`/`listEventsSince`): rather than fetching
+   broadly and filtering in application code, the SQL `WHERE` clause itself
+   is scoped to `org_id = <agent's org>` AND (workspace membership OR
+   org-wide-shared OR agent-owned OR explicitly agent-shared). Audit and
+   event queries additionally require `orgId` and only include
+   workspace-less rows (agent lifecycle events) for admin-capable agents.
+
+Proxy/temporary tokens (`credential_proxy_session_create`,
+`credential_temporary_issue`) add a fourth check: redemption via
+`credential_execute` requires the redeeming agent to be the same one the
+token was issued to, so a leaked token string alone isn't enough to reuse
+someone else's grant.
+
+This is a place where getting it right the first time is unusually
+important, so it's covered by a live end-to-end test (two full
+organizations, two workspaces, cross-tenant reads via header-spoofing,
+direct credential-id guessing, listing, audit querying, and agent-session
+lookups) rather than by mocked unit tests alone — see the isolation
+section of the test plan in the PR history for this change.
+
+**Agent authentication strategies.** `src/auth/resolveAgent.ts` is the
+single identity-resolution path shared by the REST middleware and the MCP
+HTTP transport, tried in order: mTLS client certificate, SecureStore API
+key, OIDC bearer token. All three ultimately resolve to the same
+`AgentRecord`, so everything downstream (policy, isolation, audit) is
+identical regardless of how the agent authenticated.
+
+- **mTLS** (`src/auth/mtls.ts`): active once `SECURESTORE_TLS_CERT_PATH`/
+  `KEY_PATH`/`CA_PATH` are all set, which also switches the Fastify
+  listener from HTTP to HTTPS with `requestCert: true` (`src/server.ts`).
+  Node's own TLS handshake does the chain validation against the
+  configured CA; SecureStore only trusts `socket.authorized === true` and
+  then maps the certificate's SHA-256 fingerprint to
+  `agents.auth_identifier` (`auth_method = 'mtls'`).
+  `SECURESTORE_MTLS_REQUIRE=1` rejects any connection that doesn't present
+  a valid certificate at the TLS layer; unset, a client without a
+  certificate can still connect and fall back to API-key/OIDC auth over
+  the same HTTPS listener.
+- **OIDC** (`src/auth/oidc.ts`): active once `SECURESTORE_OIDC_ISSUER`/
+  `JWKS_URI`/`AUDIENCE` are set. A bearer token that doesn't match a known
+  API key is verified via `jose`'s remote-JWKS signature/issuer/audience/
+  expiry check (not the structural-only inspection `src/detectors/jwt.ts`
+  uses for credential-detection heuristics — this one actually verifies
+  the signature), then the token's `sub` claim is matched against
+  `agents.auth_identifier` (`auth_method = 'oidc'`).
+
+Both were verified live in this session (self-signed CA/server/client
+certs via openssl for mTLS; a local JWKS server and `jose`-signed JWTs for
+OIDC): a request presenting only a valid client certificate and no bearer
+token authenticates and resolves to the registered mTLS agent, one without
+a certificate is rejected; a correctly-signed OIDC token with the right
+issuer/audience/subject authenticates, while a wrong-audience or garbage
+token is rejected.
+
+## 7. Policy engine
 
 `src/policy/engine.ts` implements deny-overrides ABAC: policies specify
 `subjects` (agent id/type/risk ceiling/owner), `actions` (the MCP tool /
@@ -183,19 +262,22 @@ agents get direct access to development/staging credentials; production
 credentials are always brokered and require human approval; any workspace
 agent can enrich metadata on a credential another agent introduced.
 
-## 7. Automatic credential capture (the ingestion pipeline)
+## 8. Automatic credential capture (the ingestion pipeline)
 
 `src/services/ingestionPipeline.ts` implements the required 13-step
 contract:
 
 1. **Detect** — `src/detectors/index.ts` runs provider token-prefix
    patterns (`patterns.ts`, GitHub/GitLab/OpenAI/Anthropic/Slack/AWS/npm/
-   Stripe/etc.), strips Authorization-header wrappers, parses DB connection
-   strings, inspects JWT structure (claims only — never signature
-   verification, which stays inside the relevant adapter's `validate()`),
-   and applies env-var-name heuristics — all with confidence scoring.
-   Operators can register additional `TokenPattern`s for internal/custom
-   credential types.
+   Stripe/etc.), recognizes PEM-armored blocks (`pem.ts`: OpenSSH/RSA/EC/
+   DSA private keys, PKCS#8/PGP signing keys, X.509 certificates — checked
+   before the single-line patterns since they're multi-line and
+   self-describing via their armor header), strips Authorization-header
+   wrappers, parses DB connection strings, inspects JWT structure (claims
+   only — never signature verification, which stays inside the relevant
+   adapter's `validate()`), and applies env-var-name heuristics — all with
+   confidence scoring. Operators can register additional `TokenPattern`s
+   for internal/custom credential types.
 2. **Dedup** — delegated to `storeCredential`'s fingerprint lookup (§4/§5).
 3. **Identify provider/type** — the detector's best-confidence match, or
    `unknown`/`text` with `status: "unresolved"` if nothing matched, so a
@@ -230,7 +312,7 @@ treated as a rotation: a new version is appended and the prior version is
 marked `superseded` (`findRotationCandidate`/`rotateInternal` in
 `credentialService.ts`) instead of creating a second credential.
 
-## 8. Provider adapters
+## 9. Provider adapters
 
 `src/adapters/types.ts` defines the full contract called for by the spec
 (provider id, credential types, token patterns, endpoints, auth scheme,
@@ -245,7 +327,7 @@ Authorization-header-shaped and `token=`/`secret=`-shaped substrings out of
 provider error bodies before they're ever logged or returned. Custom
 providers register via `adapterRegistry.register(new MyAdapter())` at boot.
 
-## 9. Direct vs. brokered access
+## 10. Direct vs. brokered access
 
 `checkPolicy()` returns an `accessMode` (`direct | brokered | temporary |
 proxy | process_injection`) chosen by the matching policy's
@@ -259,9 +341,9 @@ without re-running the full policy check each time), or
 want an explicit "temporary" grant even without a true provider-side
 short-lived-credential API). Proxy/temporary tokens live in
 `src/services/proxySessionStore.ts`, intentionally in-memory and
-per-process (§10 covers the HA implication).
+per-process (§11 covers the HA implication).
 
-## 10. What's fully implemented vs. designed as an extension point
+## 11. What's fully implemented vs. designed as an extension point
 
 Being explicit about this distinction is part of the job, not a hedge.
 
@@ -275,21 +357,49 @@ catch-up; MCP over stdio and streamable HTTP with the full 24-tool surface;
 a 1:1 REST mirror; SSE push events; Unix-socket/named-pipe listening (same
 code path — Node treats a string passed to `listen()` as a socket/pipe
 path on both platforms); Docker Compose self-hosting; audit trail covering
-every spec'd field.
+every spec'd field; org/workspace isolation enforced at session-open,
+per-credential visibility, and query-scoping layers (§6); SSH-key/TLS-cert/
+signing-key detection; scheduled expiry-sweep and health-revalidation jobs
+(`src/services/scheduledJobs.ts`) coordinated across replicas via Postgres
+advisory locks rather than a separate leader-election system; a CI
+pipeline (build, typecheck, unit tests, production-dependency audit, and a
+live Postgres-backed end-to-end smoke test) gating merges to `main`; optional
+Redis-backed rate limiting and proxy/temporary-issue session storage for
+exact (not per-replica-approximate) behavior under horizontal scale-out,
+auto-selected when `REDIS_URL` is set (verified live against a local
+Redis: window-limited rate limiting, atomic multi-use decrement down to
+exhaustion, and TTL-based expiry all behave correctly); OAuth 2.1 device-
+code (RFC 8628) and client-credentials grants alongside the original
+authorization-code + PKCE flow, all through `oauth_authorize`'s `action`
+parameter (verified live against a mock authorization server, including
+the device flow's `authorization_pending` → `authorization_pending` →
+success polling sequence); `secret_transfer_ownership`, gated to the
+current owner or an admin-capable agent, distinct from `secret_share`
+(which changes visibility, not accountability); `AwsKmsKeyProvider`
+(`KMS_PROVIDER=aws-kms`), wrapping/unwrapping DEKs via AWS KMS `Encrypt`/
+`Decrypt` against a single CMK rather than `LocalKeyProvider`'s env-var
+key — verified live against a mocked AWS KMS API (moto): the full
+envelope-encryption round-trip (generate DEK, AES-256-GCM-encrypt a
+secret, wrap the DEK via KMS, unwrap it, decrypt the secret) succeeds, and
+a tampered ciphertext blob is correctly rejected by KMS with
+`InvalidCiphertextException`; also covered by a mocked-client unit test
+(`test/awsKms.test.ts`) so it stays exercised in CI without an AWS
+dependency.
 
 **Extension points, deliberately not bundled**:
 
 | Area | Current state | Production seam |
 |---|---|---|
-| KMS/HSM | `LocalKeyProvider` (env-var-derived key) | Implement `KeyProvider` (`src/crypto/kms.ts`) against AWS KMS / GCP KMS / Vault Transit / PKCS#11 |
-| mTLS, OIDC, workload identity, passkeys, hardware-backed client keys | `agents.auth_method` column + API-key auth implemented; other methods are schema-ready but not wired | Add an auth strategy per method in `src/api/auth.ts` / `src/mcp/httpServer.ts`; agent identity model already carries `public_key`, `auth_method` |
+| KMS/HSM | `LocalKeyProvider` (env-var-derived key) and `AwsKmsKeyProvider` (`src/crypto/kms.ts`, wraps/unwraps DEKs via KMS `Encrypt`/`Decrypt` against a single CMK, `KMS_PROVIDER=aws-kms` + `AWS_KMS_KEY_ID`) are both implemented | For GCP KMS / Vault Transit / PKCS#11, implement `KeyProvider` the same way `AwsKmsKeyProvider` does and register it in `getKeyProvider()` |
+| mTLS, OIDC | Implemented — see §6a below | — |
+| Workload identity, passkeys, hardware-backed client keys | `agents.auth_method`/`auth_identifier` columns are generic enough to carry these too, but no verification strategy is wired for them yet | Add a strategy alongside mTLS/OIDC in `src/auth/resolveAgent.ts`; the agent identity model doesn't need to change |
 | gRPC | Not implemented | Tool handlers in `toolHandlers.ts` are already transport-agnostic; add a `.proto` + server wrapping the same functions, same pattern as the REST mirror |
-| Distributed rate limiting | In-memory per-process token bucket | Swap `InMemoryRateLimiter` (`agentService.ts`) for Redis INCR/PEXPIRE or a Lua token-bucket, same interface |
-| Proxy/temporary session store | In-memory per-process | Swap `ProxySessionStore` for Redis SETEX, same interface |
-| Distributed locking beyond row-level `FOR UPDATE`/unique constraints | Not needed for current operations (Postgres transactions + unique constraints are sufficient for the write patterns here) | Add Postgres advisory locks or a lease table if a future operation needs cross-statement, cross-transaction mutual exclusion |
+| Distributed rate limiting | Implemented: `RedisRateLimiter` (`redisRateLimiter.ts`, atomic Lua INCR+PEXPIRE fixed window), auto-selected over the in-memory default when `REDIS_URL` is set | Point `REDIS_URL` at a Redis instance; no code change needed |
+| Proxy/temporary session store | Implemented: `RedisProxySessionStore` (`redisProxySessionStore.ts`, atomic Lua HINCRBY+conditional DEL, TTL via Redis key expiry), auto-selected over the in-memory default when `REDIS_URL` is set | Point `REDIS_URL` at a Redis instance; no code change needed |
+| Distributed locking beyond row-level `FOR UPDATE`/unique constraints | Implemented for the one case that needed it: `scheduledJobs.ts` uses `pg_try_advisory_lock` so only one replica runs the expiry-sweep/health-revalidation tick | Add another advisory lock or a lease table if a future operation needs similar cross-statement, cross-transaction mutual exclusion |
 | Policy DSL | Custom ABAC engine (JSON documents in `policies` table) | Swap `evaluatePolicy()` internals for an OPA/Rego sidecar call if org standardizes on Rego |
 | Backup/DR | Postgres is the single source of truth; standard `pg_dump`/WAL-archiving/replica promotion applies | Document and automate per the operator's existing Postgres HA tooling (Patroni, RDS Multi-AZ, etc.) — this is intentionally left to infra, not reinvented here |
-| Leader election | Not used — no operation in this design requires a singleton leader (all writes are per-row atomic transactions) | If a future background job (e.g. expiry-sweep) needs exactly-one-runner semantics, use a Postgres advisory lock, not a new coordination system |
+| Leader election | Not used beyond the advisory-lock pattern above — no operation in this design requires a persistent, elected leader | If a future job needs true leader semantics (not just "one winner per tick"), that's a different primitive (e.g. a lease row with a heartbeat) than what's here |
 | Approval UI | `approval_request` tool/endpoint + `approval_requests` table | Wire a human-facing admin UI/Slack bot that calls `POST /v1/approvals` with `action:"decide"` |
 
 None of these are silently stubbed-and-insecure — each either fails loudly
@@ -297,7 +407,7 @@ None of these are silently stubbed-and-insecure — each either fails loudly
 `KMS_PROVIDER` throws at boot) or is a real, working default appropriate
 for a single-deployment self-hosted setup that documents its own ceiling.
 
-## 11. Required workflows, walked through
+## 12. Required workflows, walked through
 
 1. **Web AI agent stores a supplied API key, discovers endpoint/username,
    returns a stable reference.** `secret_store_detected` ->
@@ -353,7 +463,7 @@ for a single-deployment self-hosted setup that documents its own ceiling.
     (provenance-tagged metadata fields) — gated by
     `metadata_enrichment_permission` and the `secret_enrich` policy action.
 
-## 12. Threat model (summary)
+## 13. Threat model (summary)
 
 - **DB compromise without the fingerprint pepper or master key**: attacker
   gets ciphertext and fingerprints, but neither is reversible without the

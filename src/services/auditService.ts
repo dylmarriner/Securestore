@@ -2,6 +2,8 @@ import type { DbClient } from "../db/pool.js";
 import { pool } from "../db/pool.js";
 
 export interface AuditEntry {
+  /** Required: every audit row is org-scoped so a query can never leak across tenants (see AuditQuery below). */
+  orgId: string;
   userId?: string | null;
   agentId?: string | null;
   clientType?: string | null;
@@ -34,13 +36,13 @@ export interface AuditEntry {
 export async function recordAudit(client: DbClient, entry: AuditEntry): Promise<void> {
   await client.query(
     `INSERT INTO audit_log (
-       user_id, agent_id, client_type, session_id, device_id, workspace_id, project_id,
+       org_id, user_id, agent_id, client_type, session_id, device_id, workspace_id, project_id,
        credential_id, credential_version, provider, operation, access_mode, creation_source,
        introducing_agent_id, metadata_source, policy_decision, approval_decision,
        source_network, mcp_transport, result, details
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
     [
-      entry.userId ?? null, entry.agentId ?? null, entry.clientType ?? null, entry.sessionId ?? null,
+      entry.orgId, entry.userId ?? null, entry.agentId ?? null, entry.clientType ?? null, entry.sessionId ?? null,
       entry.deviceId ?? null, entry.workspaceId ?? null, entry.projectId ?? null, entry.credentialId ?? null,
       entry.credentialVersion ?? null, entry.provider ?? null, entry.operation, entry.accessMode ?? null,
       entry.creationSource ?? null, entry.introducingAgentId ?? null, entry.metadataSource ?? null,
@@ -51,7 +53,17 @@ export async function recordAudit(client: DbClient, entry: AuditEntry): Promise<
 }
 
 export interface AuditQuery {
-  workspaceId?: string;
+  /** Required: the querying agent's org. Combined with workspaceScope, this is what prevents cross-tenant reads. */
+  orgId: string;
+  /**
+   * Restricts results to rows whose workspace_id is one of these (the
+   * caller's actual workspace memberships), OR rows with no workspace at
+   * all (org/agent-lifecycle events) when `includeWorkspaceless` is true.
+   * Pass an empty array + includeWorkspaceless:false to see nothing but
+   * org-level events, or omit entirely (undefined) only for admin callers
+   * that are explicitly allowed full-org visibility.
+   */
+  workspaceScope?: { workspaceIds: string[]; includeWorkspaceless: boolean } | undefined;
   credentialId?: string;
   agentId?: string;
   operation?: string;
@@ -60,19 +72,28 @@ export interface AuditQuery {
 }
 
 export async function queryAudit(q: AuditQuery) {
-  const clauses: string[] = [];
-  const params: unknown[] = [];
-  let i = 1;
-  if (q.workspaceId) { clauses.push(`workspace_id = $${i++}`); params.push(q.workspaceId); }
+  const clauses: string[] = ["org_id = $1"];
+  const params: unknown[] = [q.orgId];
+  let i = 2;
+
+  if (q.workspaceScope) {
+    const { workspaceIds, includeWorkspaceless } = q.workspaceScope;
+    if (includeWorkspaceless) {
+      clauses.push(`(workspace_id = ANY($${i}::uuid[]) OR workspace_id IS NULL)`);
+    } else {
+      clauses.push(`workspace_id = ANY($${i}::uuid[])`);
+    }
+    params.push(workspaceIds);
+    i++;
+  }
   if (q.credentialId) { clauses.push(`credential_id = $${i++}`); params.push(q.credentialId); }
   if (q.agentId) { clauses.push(`agent_id = $${i++}`); params.push(q.agentId); }
   if (q.operation) { clauses.push(`operation = $${i++}`); params.push(q.operation); }
   if (q.since) { clauses.push(`occurred_at >= $${i++}`); params.push(q.since); }
-  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const limit = Math.min(q.limit ?? 100, 1000);
   params.push(limit);
   const { rows } = await pool.query(
-    `SELECT * FROM audit_log ${where} ORDER BY occurred_at DESC LIMIT $${i}`,
+    `SELECT * FROM audit_log WHERE ${clauses.join(" AND ")} ORDER BY occurred_at DESC LIMIT $${i}`,
     params,
   );
   return rows;

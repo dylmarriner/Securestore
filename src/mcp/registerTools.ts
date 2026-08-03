@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { AgentContext } from "./context.js";
 import { ToolError, toolSecretGet, toolSecretFind, toolSecretList, toolSecretMetadata, toolSecretStore,
   toolSecretStoreDetected, toolSecretUpdate, toolSecretEnrich, toolSecretRotate, toolSecretRevoke,
-  toolSecretDelete, toolSecretClaim, toolSecretShare, toolCredentialExecute, toolCredentialValidate,
+  toolSecretDelete, toolSecretClaim, toolSecretShare, toolSecretTransferOwnership, toolCredentialExecute, toolCredentialValidate,
   toolCredentialProxySessionCreate, toolCredentialTemporaryIssue, toolOAuthAuthorize, toolOAuthRefresh,
   toolPolicyCheck, toolApprovalRequest, toolAuditQuery, toolAgentRegister, toolAgentSessionList,
   toolCredentialEventSubscribe } from "./toolHandlers.js";
@@ -86,6 +86,13 @@ export function registerSecureStoreTools(server: McpServer, ctx: AgentContext): 
   server.tool("secret_share", "Change a credential's sharing policy (visibility scope).",
     { credentialId: z.string(), sharingPolicy: z.record(z.string(), z.unknown()) }, wrap(ctx, toolSecretShare));
 
+  server.tool("secret_transfer_ownership", "Reassign who owns/is accountable for a credential (distinct from secret_share, which changes visibility without changing ownership). Only the current owner or an admin-capable agent may call this.",
+    {
+      credentialId: z.string(),
+      ownerScope: z.enum(["personal", "workspace", "project", "organization", "agent", "service_account", "environment", "ephemeral"]),
+      ownerUserId: z.string().optional(), ownerAgentId: z.string().optional(), workspaceId: z.string().optional(),
+    }, wrap(ctx, toolSecretTransferOwnership as any));
+
   server.tool("credential_execute", "Perform a brokered operation with a credential without ever receiving its raw value. Accepts either credentialId (policy-checked per call) or a proxyToken from credential_proxy_session_create.",
     { credentialId: z.string().optional(), proxyToken: z.string().optional(), operation: z.string(), params: z.record(z.string(), z.unknown()).optional() },
     wrap(ctx, toolCredentialExecute));
@@ -99,11 +106,13 @@ export function registerSecureStoreTools(server: McpServer, ctx: AgentContext): 
   server.tool("credential_temporary_issue", "Issue a short-lived, limited-use handle for a credential. Never returns raw secret material.",
     { credentialId: z.string(), ttlSeconds: z.number().optional(), maxUses: z.number().optional() }, wrap(ctx, toolCredentialTemporaryIssue));
 
-  server.tool("oauth_authorize", "Start (action=start) or complete (action=complete) an OAuth 2.1 + PKCE authorization-code flow; on completion, stores the resulting tokens as a new credential.",
+  server.tool("oauth_authorize", "Drives OAuth 2.1 grants: authorization-code + PKCE (action=start then action=complete), device code (action=device_start then poll with action=device_poll), and client_credentials (action=client_credentials, one call). Stores the resulting tokens as a new credential.",
     {
-      action: z.enum(["start", "complete"]), provider: z.string(), clientId: z.string(), clientSecret: z.string().optional(),
-      redirectUri: z.string(), scopes: z.array(z.string()).optional(), authorizationEndpoint: z.string().optional(),
+      action: z.enum(["start", "complete", "device_start", "device_poll", "client_credentials"]),
+      provider: z.string(), clientId: z.string(), clientSecret: z.string().optional(),
+      redirectUri: z.string().optional(), scopes: z.array(z.string()).optional(), authorizationEndpoint: z.string().optional(),
       tokenEndpoint: z.string().optional(), refreshEndpoint: z.string().optional(), revocationEndpoint: z.string().optional(),
+      deviceAuthorizationEndpoint: z.string().optional(), deviceCode: z.string().optional(),
       state: z.string().optional(), code: z.string().optional(), name: z.string().optional(),
     }, wrap(ctx, toolOAuthAuthorize));
 
@@ -124,7 +133,9 @@ export function registerSecureStoreTools(server: McpServer, ctx: AgentContext): 
   server.tool("agent_register", "Register a new agent identity (requires admin capability).",
     {
       name: z.string(), agentType: z.string(), platform: z.string().optional(), version: z.string().optional(),
-      authMethod: z.string().optional(), allowedTransports: z.array(z.string()).optional(), allowedTools: z.array(z.string()).optional(),
+      authMethod: z.string().optional(),
+      authIdentifier: z.string().optional().describe("Required for authMethod 'oidc' (expected sub claim) or 'mtls' (client cert SHA-256 fingerprint)"),
+      allowedTransports: z.array(z.string()).optional(), allowedTools: z.array(z.string()).optional(),
       allowedNamespaces: z.array(z.string()).optional(), allowedProviders: z.array(z.string()).optional(), allowedOperations: z.array(z.string()).optional(),
       rawSecretAccess: z.boolean().optional(), autoIngestionPermission: z.boolean().optional(), metadataEnrichmentPermission: z.boolean().optional(),
       rotationPermission: z.boolean().optional(), revocationPermission: z.boolean().optional(),

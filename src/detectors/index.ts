@@ -2,6 +2,7 @@ import { GENERIC_SHAPE_PATTERNS, TOKEN_PATTERNS, type TokenPattern } from "./pat
 import { tryParseJwt, type JwtClaims } from "./jwt.js";
 import { hintFromEnvVarName } from "./envVarHints.js";
 import { parseConnectionString } from "./connectionString.js";
+import { detectPemBlock } from "./pem.js";
 
 export type SourceKind =
   | "agent_instruction" | "tool_input" | "mcp_tool_argument" | "api_request_config"
@@ -63,6 +64,29 @@ export function detectCredential(input: DetectionInput): DetectionResult {
   if (headerMatch) {
     inferred["authScheme"] = { value: headerMatch[1]!.toLowerCase(), confidence: 0.9, source: "header_prefix" };
     raw = headerMatch[2]!.trim();
+  }
+
+  // PEM-armored blocks (SSH keys, PKCS#8/PGP signing keys, X.509 certs) are
+  // multi-line and self-describing via their armor header — check before
+  // the single-line token patterns, which would never match a multi-line
+  // value anyway, but this keeps the branch explicit and fast.
+  const pem = detectPemBlock(raw);
+  if (pem) {
+    return {
+      matched: true,
+      provider: "generic",
+      credentialType: pem.credentialType,
+      providerConfidence: 0.3,
+      typeConfidence: 0.97,
+      authScheme: pem.credentialType === "ssh_key" ? "ssh" : undefined,
+      secretValue: raw,
+      isJwt: false,
+      sensitivity: pem.sensitivity,
+      inferredMetadata: {
+        renewalMethod: { value: pem.encrypted ? "manual (passphrase-protected)" : "manual", confidence: 0.9, source: "pem_header" },
+        ...(pem.keyAlgorithm ? { notes: { value: `${pem.label}${pem.keyAlgorithm ? ` (${pem.keyAlgorithm})` : ""}`, confidence: 0.9, source: "pem_header" } } : {}),
+      },
+    };
   }
 
   // Connection strings carry their own username/host metadata.

@@ -1,35 +1,41 @@
 import { randomBytes } from "node:crypto";
+import { getRedisClient, isRedisConfigured } from "./redisClient.js";
+import { RedisProxySessionStore } from "./redisProxySessionStore.js";
 
-interface ProxySession {
+export interface ProxySession {
   credentialId: string;
   agentId: string;
   workspaceId: string | null;
-  expiresAt: number;
   usesRemaining: number;
   mode: "proxy" | "temporary";
 }
 
-/**
- * Ephemeral brokered-access sessions/tokens. Deliberately in-memory and
- * per-process: a proxy/temporary-issue token is meant to live seconds-to-
- * minutes, so a restart invalidating it is an acceptable failure mode, and
- * it keeps `credential_execute` fast (no DB round-trip to re-check a token
- * that was already policy-checked at issuance). For a horizontally scaled
- * deployment where a token must be redeemable against *any* replica, back
- * this with Redis (SETEX + DECR for usesRemaining) instead — same
- * interface, no call-site changes.
- */
-class ProxySessionStore {
-  private readonly sessions = new Map<string, ProxySession>();
+export interface ProxySessionStoreBackend {
+  create(input: ProxySession & { ttlSeconds: number }): Promise<{ token: string; expiresAt: string }>;
+  redeem(token: string): Promise<ProxySession | null>;
+}
 
-  create(input: Omit<ProxySession, "expiresAt"> & { ttlSeconds: number }): { token: string; expiresAt: string } {
+/**
+ * In-memory backend. A proxy/temporary-issue token is meant to live
+ * seconds-to-minutes, so a process restart invalidating it is an
+ * acceptable failure mode for a single-instance deployment, and it keeps
+ * `credential_execute` fast (no round-trip to re-check a token that was
+ * already policy-checked at issuance). For a horizontally scaled
+ * deployment where a token must be redeemable against *any* replica, set
+ * REDIS_URL to switch to RedisProxySessionStore — same interface.
+ */
+class InMemoryProxySessionStore implements ProxySessionStoreBackend {
+  private readonly sessions = new Map<string, ProxySession & { expiresAt: number }>();
+
+  async create(input: ProxySession & { ttlSeconds: number }): Promise<{ token: string; expiresAt: string }> {
     const token = randomBytes(24).toString("base64url");
     const expiresAt = Date.now() + input.ttlSeconds * 1000;
-    this.sessions.set(token, { ...input, expiresAt });
+    const { ttlSeconds: _ttlSeconds, ...session } = input;
+    this.sessions.set(token, { ...session, expiresAt });
     return { token, expiresAt: new Date(expiresAt).toISOString() };
   }
 
-  redeem(token: string): ProxySession | null {
+  async redeem(token: string): Promise<ProxySession | null> {
     const session = this.sessions.get(token);
     if (!session) return null;
     if (session.expiresAt < Date.now()) {
@@ -42,4 +48,17 @@ class ProxySessionStore {
   }
 }
 
-export const proxySessionStore = new ProxySessionStore();
+let instance: ProxySessionStoreBackend | undefined;
+
+function resolveStore(): ProxySessionStoreBackend {
+  if (instance) return instance;
+  instance = isRedisConfigured()
+    ? new RedisProxySessionStore(getRedisClient()!)
+    : new InMemoryProxySessionStore();
+  return instance;
+}
+
+export const proxySessionStore: ProxySessionStoreBackend = {
+  create: (input) => resolveStore().create(input),
+  redeem: (token) => resolveStore().redeem(token),
+};
