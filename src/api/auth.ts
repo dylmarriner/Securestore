@@ -37,8 +37,13 @@ export async function requireAgent(request: FastifyRequest, reply: FastifyReply)
   const workspaceId = (request.headers["x-securestore-workspace-id"] as string | undefined) ?? null;
   let sessionId = request.headers["x-securestore-session-id"] as string | undefined;
   if (!sessionId) {
-    const session = await openSession(agent.id, workspaceId, "http", request.ip);
-    sessionId = session.sessionId;
+    try {
+      const session = await openSession(agent.id, workspaceId, "http", request.ip);
+      sessionId = session.sessionId;
+    } catch (err) {
+      reply.code(403).send({ error: err instanceof Error ? err.message : "workspace access denied" });
+      return reply;
+    }
     reply.header("x-securestore-session-id", sessionId);
   }
 

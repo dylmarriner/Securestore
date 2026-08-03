@@ -82,6 +82,7 @@ export async function checkPolicy(
 }
 
 export async function recordAccessDenied(
+  orgId: string,
   agentId: string,
   workspaceId: string | null,
   credentialId: string | null,
@@ -90,12 +91,12 @@ export async function recordAccessDenied(
 ): Promise<void> {
   await withTransaction(async (client) => {
     await recordAudit(client, {
-      agentId, workspaceId, credentialId, operation, policyDecision: "deny",
+      orgId, agentId, workspaceId, credentialId, operation, policyDecision: "deny",
       result: "denied", details: { reason },
     });
     const { eventBus } = await import("./eventBus.js");
     await eventBus.publish(client, "access.denied", {
-      workspaceId, credentialId, agentId, payload: { operation, reason },
+      orgId, workspaceId, credentialId, agentId, payload: { operation, reason },
     });
   });
 }
@@ -108,15 +109,27 @@ export async function createApprovalRequest(credentialId: string, agentId: strin
   return rows[0].id;
 }
 
-export async function decideApproval(approvalId: string, decidedBy: string, approve: boolean, reason?: string) {
+// Both queries join through `credentials` and filter on its org_id, so an
+// agent in one org can't decide or inspect another org's approval request
+// even if it knows/guesses the approval id.
+
+export async function decideApproval(orgId: string, approvalId: string, decidedBy: string, approve: boolean, reason?: string) {
   const { rows } = await pool.query(
-    `UPDATE approval_requests SET status = $1, decided_by = $2, decided_at = now(), reason = $3 WHERE id = $4 RETURNING *`,
-    [approve ? "approved" : "denied", decidedBy, reason ?? null, approvalId],
+    `UPDATE approval_requests ar SET status = $1, decided_by = $2, decided_at = now(), reason = $3
+     FROM credentials c
+     WHERE ar.id = $4 AND ar.credential_id = c.id AND c.org_id = $5
+     RETURNING ar.*`,
+    [approve ? "approved" : "denied", decidedBy, reason ?? null, approvalId, orgId],
   );
-  return rows[0];
+  return rows[0] ?? null;
 }
 
-export async function getApprovalStatus(approvalId: string) {
-  const { rows } = await pool.query(`SELECT * FROM approval_requests WHERE id = $1`, [approvalId]);
+export async function getApprovalStatus(orgId: string, approvalId: string) {
+  const { rows } = await pool.query(
+    `SELECT ar.* FROM approval_requests ar
+     JOIN credentials c ON c.id = ar.credential_id
+     WHERE ar.id = $1 AND c.org_id = $2`,
+    [approvalId, orgId],
+  );
   return rows[0] ?? null;
 }

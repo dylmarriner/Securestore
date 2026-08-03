@@ -101,13 +101,26 @@ class EventBus {
     );
   }
 
-  /** Live subscription for in-process consumers (MCP streams, SSE). Returns an unsubscribe function. */
+  /**
+   * Live subscription for in-process consumers (MCP streams, SSE). `scope`
+   * is mandatory and mirrors AuditQuery's isolation model: orgId always
+   * filters, workspaceIds restricts to the caller's actual memberships
+   * (plus workspaceless org-wide events when includeWorkspaceless is set).
+   * There is intentionally no "no scope = everything" fallback — that was
+   * the bug (an agent with no single workspace selected could see every
+   * other org's events). Returns an unsubscribe function.
+   */
   subscribe(
-    filter: { workspaceId?: string; eventTypes?: SecureStoreEventType[] },
+    scope: { orgId: string; workspaceIds: string[]; includeWorkspaceless?: boolean },
+    filter: { eventTypes?: SecureStoreEventType[] },
     handler: (event: SecureStoreEvent) => void,
   ): () => void {
     const listener = (event: SecureStoreEvent) => {
-      if (filter.workspaceId && event.workspaceId !== filter.workspaceId) return;
+      if (event.orgId !== scope.orgId) return;
+      const workspaceMatch =
+        (event.workspaceId && scope.workspaceIds.includes(event.workspaceId)) ||
+        (!event.workspaceId && scope.includeWorkspaceless);
+      if (!workspaceMatch) return;
       if (filter.eventTypes && !filter.eventTypes.includes(event.eventType)) return;
       handler(event);
     };
@@ -116,12 +129,17 @@ class EventBus {
   }
 
   /** Gap-free catch-up for a client that reconnects after being offline; dedupe on event id downstream. */
-  async listEventsSince(sinceId: number, workspaceId?: string, limit = 500): Promise<SecureStoreEvent[]> {
+  async listEventsSince(
+    sinceId: number,
+    scope: { orgId: string; workspaceIds: string[]; includeWorkspaceless?: boolean },
+    limit = 500,
+  ): Promise<SecureStoreEvent[]> {
     const { rows } = await pool.query(
-      workspaceId
-        ? `SELECT * FROM events WHERE id > $1 AND workspace_id = $2 ORDER BY id ASC LIMIT $3`
-        : `SELECT * FROM events WHERE id > $1 ORDER BY id ASC LIMIT $2`,
-      workspaceId ? [sinceId, workspaceId, limit] : [sinceId, limit],
+      `SELECT * FROM events
+       WHERE id > $1 AND org_id = $2
+         AND (workspace_id = ANY($3::uuid[]) OR ($4 AND workspace_id IS NULL))
+       ORDER BY id ASC LIMIT $5`,
+      [sinceId, scope.orgId, scope.workspaceIds, scope.includeWorkspaceless ?? false, limit],
     );
     return rows.map(rowToEvent);
   }

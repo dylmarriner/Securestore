@@ -49,6 +49,14 @@ export async function registerAgent(input: RegisterAgentInput): Promise<{ agent:
     const agentRow = rows[0];
 
     for (const wsId of input.workspaceIds ?? []) {
+      // Membership can only be granted into a workspace that actually
+      // belongs to the same org as the agent being created — otherwise an
+      // admin in org A could hand a new agent visibility into org B's
+      // workspaces just by supplying its UUID.
+      const { rows: wsRows } = await client.query(`SELECT 1 FROM workspaces WHERE id = $1 AND org_id = $2`, [wsId, input.orgId]);
+      if (wsRows.length === 0) {
+        throw new Error(`workspace ${wsId} does not belong to org ${input.orgId}`);
+      }
       await client.query(
         `INSERT INTO agent_workspace_memberships (agent_id, workspace_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
         [agentRow.id, wsId],
@@ -97,12 +105,40 @@ export async function revokeAgent(agentId: string): Promise<void> {
   );
 }
 
+export class WorkspaceAccessError extends Error {}
+
+/** Membership is what actually scopes workspace-visible credentials — see src/services/visibilityService.ts. */
+export async function isAgentWorkspaceMember(agentId: string, workspaceId: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1 FROM agent_workspace_memberships WHERE agent_id = $1 AND workspace_id = $2`,
+    [agentId, workspaceId],
+  );
+  return rows.length > 0;
+}
+
+export async function getAgentWorkspaceIds(agentId: string): Promise<string[]> {
+  const { rows } = await pool.query(
+    `SELECT workspace_id FROM agent_workspace_memberships WHERE agent_id = $1`,
+    [agentId],
+  );
+  return rows.map((r) => r.workspace_id);
+}
+
+/**
+ * Opening a session is where workspace selection is authorized: a caller
+ * cannot simply supply an arbitrary X-SecureStore-Workspace-Id header and
+ * get scoped into a workspace it isn't a member of. This is what makes the
+ * `ctx.workspaceId` used throughout the tool handlers trustworthy.
+ */
 export async function openSession(
   agentId: string,
   workspaceId: string | null,
   transport: string,
   clientNetwork?: string,
 ): Promise<{ sessionId: string }> {
+  if (workspaceId && !(await isAgentWorkspaceMember(agentId, workspaceId))) {
+    throw new WorkspaceAccessError(`agent is not a member of workspace ${workspaceId}`);
+  }
   const { rows } = await pool.query(
     `INSERT INTO agent_sessions (agent_id, workspace_id, transport, client_network, expires_at)
      VALUES ($1, $2, $3, $4, now() + interval '12 hours') RETURNING id`,

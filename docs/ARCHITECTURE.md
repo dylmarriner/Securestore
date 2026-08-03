@@ -18,7 +18,7 @@ ownership assumption.
 
 **Non-goals for this implementation**: a full enterprise IdP (SSO/SCIM),
 a general-purpose workflow/approval UI, a bundled HSM, or a Rego-compatible
-policy DSL. Each has a clearly marked extension seam (§10) rather than a
+policy DSL. Each has a clearly marked extension seam (§11) rather than a
 half-built version of the real thing.
 
 ## 2. High-level architecture
@@ -93,7 +93,7 @@ choices:
 - **`credentials.metadata` is a JSONB map of `{field: {value, confidence,
   source, verified, updatedAt, introducedByAgentId}}`** — every metadata
   field carries its own provenance, which is what makes the
-  merge-without-clobbering-verified-data rule (§7) possible.
+  merge-without-clobbering-verified-data rule (§8) possible.
 - **`events` is a transactional outbox**: every mutation inserts its event
   row in the same DB transaction, so an event can never be observed for a
   write that rolled back, or dropped for one that committed.
@@ -153,7 +153,52 @@ outside `src/crypto/envelope.ts`'s decrypt call sites.
   `nextSinceEventId` (`credential_event_subscribe`), so a redelivered or
   out-of-order NOTIFY can't cause double-processing.
 
-## 6. Policy engine
+## 6. Multi-tenant isolation
+
+Every credential, audit entry, and event carries an `org_id`; every
+credential additionally carries a `workspace_id` (nullable only for
+explicitly org-wide-shared credentials). Isolation is enforced at three
+points, not just one, because a single missed call site is enough to leak
+across tenants:
+
+1. **Session open** (`openSession` in `src/services/agentService.ts`): a
+   caller cannot select a workspace it isn't a member of via the
+   `X-SecureStore-Workspace-Id` header/session param — membership is
+   checked against `agent_workspace_memberships` before a session (and
+   therefore `ctx.workspaceId`) is issued. This is what makes
+   `ctx.workspaceId` trustworthy everywhere downstream.
+2. **Per-credential visibility** (`src/services/visibilityService.ts`,
+   `assertCredentialVisible`/`loadVisibleCredential`): every tool handler
+   that operates on a specific `credentialId` resolves it through this gate
+   before any policy decision is made. It checks `credential.orgId ===
+   agent.orgId` and then the credential's `sharing_policy.visibility`
+   (`workspace` [default, requires membership] | `organization` [any agent
+   in the org] | `agents` [explicit allow-list] | `private` [owner only]).
+   A cross-tenant or out-of-scope request fails as `not_found`, never
+   `denied` — so it can't be used to confirm a credential's existence.
+3. **Listing/query scoping** (`visibilityWhereClause` in
+   `visibilityService.ts`, reused by `findCredentials`, `queryAudit`, and
+   the event bus's `subscribe`/`listEventsSince`): rather than fetching
+   broadly and filtering in application code, the SQL `WHERE` clause itself
+   is scoped to `org_id = <agent's org>` AND (workspace membership OR
+   org-wide-shared OR agent-owned OR explicitly agent-shared). Audit and
+   event queries additionally require `orgId` and only include
+   workspace-less rows (agent lifecycle events) for admin-capable agents.
+
+Proxy/temporary tokens (`credential_proxy_session_create`,
+`credential_temporary_issue`) add a fourth check: redemption via
+`credential_execute` requires the redeeming agent to be the same one the
+token was issued to, so a leaked token string alone isn't enough to reuse
+someone else's grant.
+
+This is a place where getting it right the first time is unusually
+important, so it's covered by a live end-to-end test (two full
+organizations, two workspaces, cross-tenant reads via header-spoofing,
+direct credential-id guessing, listing, audit querying, and agent-session
+lookups) rather than by mocked unit tests alone — see the isolation
+section of the test plan in the PR history for this change.
+
+## 7. Policy engine
 
 `src/policy/engine.ts` implements deny-overrides ABAC: policies specify
 `subjects` (agent id/type/risk ceiling/owner), `actions` (the MCP tool /
@@ -183,7 +228,7 @@ agents get direct access to development/staging credentials; production
 credentials are always brokered and require human approval; any workspace
 agent can enrich metadata on a credential another agent introduced.
 
-## 7. Automatic credential capture (the ingestion pipeline)
+## 8. Automatic credential capture (the ingestion pipeline)
 
 `src/services/ingestionPipeline.ts` implements the required 13-step
 contract:
@@ -230,7 +275,7 @@ treated as a rotation: a new version is appended and the prior version is
 marked `superseded` (`findRotationCandidate`/`rotateInternal` in
 `credentialService.ts`) instead of creating a second credential.
 
-## 8. Provider adapters
+## 9. Provider adapters
 
 `src/adapters/types.ts` defines the full contract called for by the spec
 (provider id, credential types, token patterns, endpoints, auth scheme,
@@ -245,7 +290,7 @@ Authorization-header-shaped and `token=`/`secret=`-shaped substrings out of
 provider error bodies before they're ever logged or returned. Custom
 providers register via `adapterRegistry.register(new MyAdapter())` at boot.
 
-## 9. Direct vs. brokered access
+## 10. Direct vs. brokered access
 
 `checkPolicy()` returns an `accessMode` (`direct | brokered | temporary |
 proxy | process_injection`) chosen by the matching policy's
@@ -259,9 +304,9 @@ without re-running the full policy check each time), or
 want an explicit "temporary" grant even without a true provider-side
 short-lived-credential API). Proxy/temporary tokens live in
 `src/services/proxySessionStore.ts`, intentionally in-memory and
-per-process (§10 covers the HA implication).
+per-process (§11 covers the HA implication).
 
-## 10. What's fully implemented vs. designed as an extension point
+## 11. What's fully implemented vs. designed as an extension point
 
 Being explicit about this distinction is part of the job, not a hedge.
 
@@ -297,7 +342,7 @@ None of these are silently stubbed-and-insecure — each either fails loudly
 `KMS_PROVIDER` throws at boot) or is a real, working default appropriate
 for a single-deployment self-hosted setup that documents its own ceiling.
 
-## 11. Required workflows, walked through
+## 12. Required workflows, walked through
 
 1. **Web AI agent stores a supplied API key, discovers endpoint/username,
    returns a stable reference.** `secret_store_detected` ->
@@ -353,7 +398,7 @@ for a single-deployment self-hosted setup that documents its own ceiling.
     (provenance-tagged metadata fields) — gated by
     `metadata_enrichment_permission` and the `secret_enrich` policy action.
 
-## 12. Threat model (summary)
+## 13. Threat model (summary)
 
 - **DB compromise without the fingerprint pepper or master key**: attacker
   gets ciphertext and fingerprints, but neither is reversible without the

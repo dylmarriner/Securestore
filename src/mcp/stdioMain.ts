@@ -26,7 +26,13 @@ async function main() {
   }
 
   const workspaceId = process.env.SECURESTORE_WORKSPACE_ID ?? null;
-  const { sessionId } = await openSession(agent.id, workspaceId, "stdio");
+  let sessionId: string;
+  try {
+    ({ sessionId } = await openSession(agent.id, workspaceId, "stdio"));
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
 
   const ctx: AgentContext = { agent, sessionId, workspaceId, transport: "stdio" };
 

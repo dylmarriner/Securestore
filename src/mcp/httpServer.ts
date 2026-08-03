@@ -71,7 +71,13 @@ export function registerMcpHttpRoutes(app: FastifyInstance): void {
 
     const workspaceId = (request.headers["x-securestore-workspace-id"] as string | undefined) ?? null;
     const sourceNetwork = request.ip;
-    const { sessionId } = await openSession(agent.id, workspaceId, "http", sourceNetwork);
+    let sessionId: string;
+    try {
+      ({ sessionId } = await openSession(agent.id, workspaceId, "http", sourceNetwork));
+    } catch (err) {
+      reply.code(403).send({ error: err instanceof Error ? err.message : "workspace access denied" });
+      return;
+    }
     const ctx: AgentContext = { agent, sessionId, workspaceId, transport: "http", sourceNetwork };
 
     const server = new McpServer({ name: "securestore", version: "0.1.0" });

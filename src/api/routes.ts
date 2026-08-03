@@ -82,9 +82,15 @@ export function registerRestRoutes(app: FastifyInstance): void {
       connection: "keep-alive",
     });
 
-    const unsubscribe = eventBus.subscribe({ workspaceId: ctx.workspaceId ?? undefined }, (event) => {
-      reply.raw.write(`id: ${event.id}\nevent: ${event.eventType}\ndata: ${JSON.stringify(event)}\n\n`);
-    });
+    const { getAgentWorkspaceIds } = await import("../services/agentService.js");
+    const memberWorkspaceIds = await getAgentWorkspaceIds(ctx.agent.id);
+    const unsubscribe = eventBus.subscribe(
+      { orgId: ctx.agent.orgId, workspaceIds: memberWorkspaceIds, includeWorkspaceless: ctx.agent.metadataAdminPermission },
+      {},
+      (event) => {
+        reply.raw.write(`id: ${event.id}\nevent: ${event.eventType}\ndata: ${JSON.stringify(event)}\n\n`);
+      },
+    );
     request.raw.on("close", unsubscribe);
   });
 

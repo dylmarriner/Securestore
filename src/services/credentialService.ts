@@ -4,7 +4,8 @@ import { encryptSecret, decryptSecret } from "../crypto/envelope.js";
 import { fingerprintSecret, normalizeSecretForFingerprint } from "../crypto/fingerprint.js";
 import { eventBus } from "./eventBus.js";
 import { recordAudit } from "./auditService.js";
-import type { CredentialMetadata, CredentialRecord, MetadataField, OwnerScope } from "./types.js";
+import { visibilityWhereClause } from "./visibilityService.js";
+import type { CredentialMetadata, CredentialRecord, OwnerScope } from "./types.js";
 
 export class DuplicateCredentialError extends Error {}
 
@@ -80,6 +81,7 @@ export async function storeCredential(input: StoreCredentialInput): Promise<Stor
       const merged = await mergeIncomingMetadata(client, credentialId, input);
       await touchLastUsed(client, credentialId, input.introducingAgentId);
       await recordAudit(client, {
+        orgId: input.orgId,
         agentId: input.introducingAgentId,
         workspaceId: input.workspaceId,
         credentialId,
@@ -166,6 +168,7 @@ async function createCredential(
   await client.query(`UPDATE credentials SET current_version_id = $1 WHERE id = $2`, [versionId, credentialId]);
 
   await recordAudit(client, {
+    orgId: input.orgId,
     agentId: input.introducingAgentId,
     workspaceId: input.workspaceId,
     credentialId,
@@ -333,6 +336,7 @@ async function rotateInternal(
   await mergeIncomingMetadata(client, credentialId, input as StoreCredentialInput);
 
   await recordAudit(client, {
+    orgId: input.orgId,
     agentId: input.introducingAgentId,
     workspaceId: input.workspaceId,
     credentialId,
@@ -377,6 +381,8 @@ export async function getCredential(credentialId: string): Promise<CredentialRec
 }
 
 export interface FindCredentialsQuery {
+  /** Isolation scope — required. See src/services/visibilityService.ts. */
+  visibleTo: { orgId: string; agentId: string; memberWorkspaceIds: string[] };
   workspaceId?: string;
   provider?: string;
   credentialType?: string;
@@ -388,9 +394,10 @@ export interface FindCredentialsQuery {
 }
 
 export async function findCredentials(q: FindCredentialsQuery): Promise<CredentialRecord[]> {
-  const clauses: string[] = ["c.status != 'deleted'"];
-  const params: unknown[] = [];
-  let i = 1;
+  const { clause: visibilityClause, paramCount } = visibilityWhereClause(1);
+  const clauses: string[] = ["c.status != 'deleted'", visibilityClause];
+  const params: unknown[] = [q.visibleTo.orgId, q.visibleTo.agentId, q.visibleTo.memberWorkspaceIds];
+  let i = paramCount + 1;
   if (q.workspaceId) { clauses.push(`c.workspace_id = $${i++}`); params.push(q.workspaceId); }
   if (q.provider) { clauses.push(`c.provider = $${i++}`); params.push(q.provider); }
   if (q.credentialType) { clauses.push(`c.credential_type = $${i++}`); params.push(q.credentialType); }
@@ -425,6 +432,7 @@ export async function revealSecret(credentialId: string, agentId: string, sessio
     });
     await touchLastUsed(client, credentialId, agentId);
     await recordAudit(client, {
+      orgId: cred.orgId,
       agentId, workspaceId: cred.workspaceId, credentialId, provider: cred.provider,
       operation: "secret_get", accessMode: "direct", policyDecision: "allow",
       sessionId: sessionCtx.sessionId, mcpTransport: sessionCtx.mcpTransport, sourceNetwork: sessionCtx.sourceNetwork,
@@ -469,6 +477,7 @@ export async function updateMetadata(
       [JSON.stringify(merged), opts.enrichmentStatus ?? null, credentialId],
     );
     await recordAudit(client, {
+      orgId: existing.orgId,
       agentId, workspaceId: existing.workspaceId, credentialId, provider: existing.provider,
       operation: "secret_enrich", accessMode: "direct", policyDecision: "allow", metadataSource: "manual_enrich",
       result: "success", details: { fields: Object.keys(fields) },
@@ -496,6 +505,7 @@ export async function markValidation(
       [outcome.result, outcome.valid ? "healthy" : "invalid", outcome.valid, credentialId],
     );
     await recordAudit(client, {
+      orgId: cred.orgId,
       agentId, workspaceId: cred.workspaceId, credentialId, provider: cred.provider,
       operation: "credential_validate", accessMode: "direct", policyDecision: "allow",
       result: outcome.valid ? "success" : "error", details: { result: outcome.result },
@@ -517,6 +527,7 @@ export async function revokeCredential(credentialId: string, agentId: string, re
       [credentialId],
     );
     await recordAudit(client, {
+      orgId: cred.orgId,
       agentId, workspaceId: cred.workspaceId, credentialId, provider: cred.provider,
       operation: "secret_revoke", accessMode: "direct", policyDecision: "allow",
       result: "success", details: { reason },
@@ -539,6 +550,7 @@ export async function deleteCredential(credentialId: string, agentId: string, ha
       await client.query(`UPDATE credentials SET status = 'deleted', deleted_at = now() WHERE id = $1`, [credentialId]);
     }
     await recordAudit(client, {
+      orgId: cred.orgId,
       agentId, workspaceId: cred.workspaceId, credentialId, provider: cred.provider,
       operation: "secret_delete", accessMode: "direct", policyDecision: "allow",
       result: "success", details: { hard },
@@ -558,6 +570,7 @@ export async function claimCredential(credentialId: string, agentId: string): Pr
     );
     const cred = (await loadCredential(client, credentialId))!;
     await recordAudit(client, {
+      orgId: cred.orgId,
       agentId, workspaceId: cred.workspaceId, credentialId, provider: cred.provider,
       operation: "secret_claim", accessMode: "direct", policyDecision: "allow", result: "success",
     });
@@ -577,6 +590,7 @@ export async function shareCredential(
     ]);
     const cred = (await loadCredential(client, credentialId))!;
     await recordAudit(client, {
+      orgId: cred.orgId,
       agentId, workspaceId: cred.workspaceId, credentialId, provider: cred.provider,
       operation: "secret_share", accessMode: "direct", policyDecision: "allow", result: "success",
       details: { sharingPolicy },
