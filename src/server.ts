@@ -4,6 +4,7 @@ import { config } from "./config.js";
 import { eventBus } from "./services/eventBus.js";
 import { registerRestRoutes } from "./api/routes.js";
 import { registerMcpHttpRoutes } from "./mcp/httpServer.js";
+import { startScheduledJobs } from "./services/scheduledJobs.js";
 
 /**
  * Builds one Fastify app exposing both the REST API and the MCP
@@ -25,6 +26,14 @@ export async function buildApp() {
 async function main() {
   await eventBus.start();
   const app = await buildApp();
+
+  // Every replica calls this; the advisory locks in scheduledJobs.ts
+  // ensure only one of them actually does the work per tick. Set
+  // SECURESTORE_DISABLE_SCHEDULED_JOBS=1 to opt a replica out entirely
+  // (e.g. a read-heavy replica you don't want doing background writes).
+  if (process.env.SECURESTORE_DISABLE_SCHEDULED_JOBS !== "1") {
+    startScheduledJobs();
+  }
 
   await app.listen({ host: config.http.host, port: config.http.port });
   app.log.info(`SecureStore listening on http://${config.http.host}:${config.http.port}`);

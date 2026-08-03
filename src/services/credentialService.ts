@@ -492,7 +492,7 @@ export async function updateMetadata(
 
 export async function markValidation(
   credentialId: string,
-  agentId: string,
+  agentId: string | null,
   outcome: { valid: boolean; result: string },
 ): Promise<void> {
   await withTransaction(async (client) => {

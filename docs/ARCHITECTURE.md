@@ -323,7 +323,13 @@ catch-up; MCP over stdio and streamable HTTP with the full 24-tool surface;
 a 1:1 REST mirror; SSE push events; Unix-socket/named-pipe listening (same
 code path — Node treats a string passed to `listen()` as a socket/pipe
 path on both platforms); Docker Compose self-hosting; audit trail covering
-every spec'd field.
+every spec'd field; org/workspace isolation enforced at session-open,
+per-credential visibility, and query-scoping layers (§6); SSH-key/TLS-cert/
+signing-key detection; scheduled expiry-sweep and health-revalidation jobs
+(`src/services/scheduledJobs.ts`) coordinated across replicas via Postgres
+advisory locks rather than a separate leader-election system; a CI
+pipeline (build, typecheck, unit tests, production-dependency audit, and a
+live Postgres-backed end-to-end smoke test) gating merges to `main`.
 
 **Extension points, deliberately not bundled**:
 
