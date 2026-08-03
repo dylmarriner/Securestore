@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - name: Typecheck + build
+        run: npm run build
+      - name: Unit tests
+        run: npm test
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      # Only the production dependency graph matters for what actually
+      # ships (see Dockerfile: runtime image is `npm install --omit=dev`).
+      # Dev-only tooling (vitest/vite/esbuild) advisories are tracked but
+      # don't block merges.
+      - name: Audit production dependencies (fails on high/critical)
+        run: npm audit --omit=dev --audit-level=high
+
+  integration-smoke:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: securestore
+          POSTGRES_PASSWORD: securestore
+          POSTGRES_DB: securestore
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U securestore"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://securestore:securestore@localhost:5432/securestore
+      PORT: "8443"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - name: Generate ephemeral 32-byte keys for this CI run
+        run: |
+          echo "SECURESTORE_MASTER_KEY=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
+          echo "SECURESTORE_FINGERPRINT_PEPPER=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
+          echo "SECURESTORE_APIKEY_PEPPER=$(openssl rand -base64 32)" >> "$GITHUB_ENV"
+      - run: npm run build
+      - name: Run migrations
+        run: node dist/db/migrate.js
+      - name: Seed a first org/workspace/admin agent
+        run: node dist/scripts/seed.js | tee seed.log
+      - name: Start the server
+        run: nohup node dist/server.js > server.log 2>&1 & echo $! > server.pid
+      - name: Wait for health check
+        run: |
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:8443/healthz; then exit 0; fi
+            sleep 1
+          done
+          echo "server never became healthy"; cat server.log; exit 1
+      - name: Store, dedupe, and retrieve a credential end-to-end
+        run: |
+          API_KEY=$(grep adminApiKey seed.log | awk '{print $2}')
+          WORKSPACE=$(grep workspaceId seed.log | awk '{print $2}')
+
+          RESP=$(curl -sf -X POST http://localhost:8443/v1/secrets \
+            -H "Authorization: Bearer $API_KEY" -H "X-SecureStore-Workspace-Id: $WORKSPACE" -H "Content-Type: application/json" \
+            -d '{"name":"ci-check","provider":"github","credentialType":"pat","secretValue":"ghp_cismoketestvalueXXXXXXXXXXXXXXXX","environment":"development"}')
+          CRED_ID=$(node -e "console.log(JSON.parse(process.argv[1]).credentialId)" "$RESP")
+
+          DEDUPE_RESP=$(curl -sf -X POST http://localhost:8443/v1/secrets \
+            -H "Authorization: Bearer $API_KEY" -H "X-SecureStore-Workspace-Id: $WORKSPACE" -H "Content-Type: application/json" \
+            -d '{"name":"ci-check-dup","provider":"github","credentialType":"pat","secretValue":"ghp_cismoketestvalueXXXXXXXXXXXXXXXX","environment":"development"}')
+          DEDUPE_ID=$(node -e "console.log(JSON.parse(process.argv[1]).credentialId)" "$DEDUPE_RESP")
+          if [ "$CRED_ID" != "$DEDUPE_ID" ]; then
+            echo "dedup failed: storing the same secret twice produced two different credential ids"
+            exit 1
+          fi
+
+          GET_RESP=$(curl -sf http://localhost:8443/v1/secrets/$CRED_ID \
+            -H "Authorization: Bearer $API_KEY" -H "X-SecureStore-Workspace-Id: $WORKSPACE")
+          VALUE=$(node -e "console.log(JSON.parse(process.argv[1]).value)" "$GET_RESP")
+          if [ "$VALUE" != "ghp_cismoketestvalueXXXXXXXXXXXXXXXX" ]; then
+            echo "round-trip mismatch: got '$VALUE'"
+            exit 1
+          fi
+          echo "store -> dedupe -> get round-trip OK"
+      - name: Dump server log on failure
+        if: failure()
+        run: cat server.log || true
+      - name: Stop the server
+        if: always()
+        run: kill $(cat server.pid) 2>/dev/null || true
