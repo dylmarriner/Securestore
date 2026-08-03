@@ -334,7 +334,14 @@ Redis-backed rate limiting and proxy/temporary-issue session storage for
 exact (not per-replica-approximate) behavior under horizontal scale-out,
 auto-selected when `REDIS_URL` is set (verified live against a local
 Redis: window-limited rate limiting, atomic multi-use decrement down to
-exhaustion, and TTL-based expiry all behave correctly).
+exhaustion, and TTL-based expiry all behave correctly); OAuth 2.1 device-
+code (RFC 8628) and client-credentials grants alongside the original
+authorization-code + PKCE flow, all through `oauth_authorize`'s `action`
+parameter (verified live against a mock authorization server, including
+the device flow's `authorization_pending` → `authorization_pending` →
+success polling sequence); `secret_transfer_ownership`, gated to the
+current owner or an admin-capable agent, distinct from `secret_share`
+(which changes visibility, not accountability).
 
 **Extension points, deliberately not bundled**:
 

@@ -3,7 +3,7 @@ import { checkPolicy, recordAccessDenied, createApprovalRequest, decideApproval,
 import {
   findCredentials, getCredential, revealSecret, revealSecretForBrokeredUse,
   updateMetadata, revokeCredential, deleteCredential, claimCredential, shareCredential,
-  markValidation, storeCredential,
+  markValidation, storeCredential, transferOwnership, type TransferOwnershipInput,
 } from "../services/credentialService.js";
 import { ingestDetectedCredential, type IngestInput } from "../services/ingestionPipeline.js";
 import { adapterRegistry } from "../adapters/registry.js";
@@ -11,7 +11,10 @@ import { queryAudit } from "../services/auditService.js";
 import { registerAgent, listSessions, getAgent, getAgentWorkspaceIds } from "../services/agentService.js";
 import { assertCredentialVisible, VisibilityError } from "../services/visibilityService.js";
 import { proxySessionStore } from "../services/proxySessionStore.js";
-import { buildAuthorizationUrl, exchangeAuthorizationCode, refreshAccessToken, storeOAuthTokens } from "../services/oauthService.js";
+import {
+  buildAuthorizationUrl, exchangeAuthorizationCode, refreshAccessToken, storeOAuthTokens,
+  requestDeviceAuthorization, pollDeviceToken, DeviceAuthorizationPendingError, requestClientCredentialsToken,
+} from "../services/oauthService.js";
 import { eventBus } from "../services/eventBus.js";
 import { pool, withTransaction } from "../db/pool.js";
 import { recordAudit } from "../services/auditService.js";
@@ -254,6 +257,31 @@ export async function toolSecretShare(ctx: AgentContext, args: { credentialId: s
   return summarize(updated);
 }
 
+export async function toolSecretTransferOwnership(ctx: AgentContext, args: TransferOwnershipInput & { credentialId: string }) {
+  const cred = await loadVisibleCredential(ctx, args.credentialId);
+  await requirePolicy(ctx, "secret_share", cred);
+
+  const isCurrentOwner =
+    (cred.ownerAgentId && cred.ownerAgentId === ctx.agent.id) ||
+    (cred.ownerUserId && ctx.agent.ownerUserId && cred.ownerUserId === ctx.agent.ownerUserId);
+  if (!isCurrentOwner && !ctx.agent.metadataAdminPermission) {
+    throw new ToolError("only the current owner or an admin-capable agent may transfer ownership", "capability_denied");
+  }
+
+  if (args.ownerAgentId) {
+    const targetAgent = await getAgent(args.ownerAgentId);
+    if (!targetAgent || targetAgent.orgId !== ctx.agent.orgId) {
+      throw new ToolError("ownerAgentId does not refer to an agent in this org", "bad_request");
+    }
+  }
+
+  const updated = await transferOwnership(args.credentialId, ctx.agent.id, {
+    ownerScope: args.ownerScope, ownerUserId: args.ownerUserId ?? null,
+    ownerAgentId: args.ownerAgentId ?? null, workspaceId: args.workspaceId ?? null,
+  });
+  return summarize(updated);
+}
+
 // ---------------------------------------------------------------------------
 // Brokered / execution tools
 // ---------------------------------------------------------------------------
@@ -355,19 +383,77 @@ export async function toolCredentialTemporaryIssue(ctx: AgentContext, args: { cr
 // ---------------------------------------------------------------------------
 
 const pendingOAuthState = new Map<string, { codeVerifier: string; clientId: string; clientSecret?: string; redirectUri: string; provider: string; tokenEndpoint: string; refreshEndpoint?: string; authorizationEndpoint: string; revocationEndpoint?: string }>();
+const pendingDeviceFlows = new Map<string, { clientId: string; clientSecret?: string; provider: string; tokenEndpoint: string; refreshEndpoint?: string; name?: string; orgId: string; workspaceId: string | null; introducingAgentId: string }>();
 
 export async function toolOAuthAuthorize(ctx: AgentContext, args: {
-  action: "start" | "complete";
-  provider: string; clientId: string; clientSecret?: string; redirectUri: string; scopes?: string[];
+  action: "start" | "complete" | "device_start" | "device_poll" | "client_credentials";
+  provider: string; clientId: string; clientSecret?: string; redirectUri?: string; scopes?: string[];
   authorizationEndpoint?: string; tokenEndpoint?: string; refreshEndpoint?: string; revocationEndpoint?: string;
+  deviceAuthorizationEndpoint?: string; deviceCode?: string;
   state?: string; code?: string; name?: string;
 }) {
   const adapter = adapterRegistry.get(args.provider);
-  const authorizationEndpoint = args.authorizationEndpoint ?? adapter?.oauth?.authorizationEndpoint;
   const tokenEndpoint = args.tokenEndpoint ?? adapter?.oauth?.tokenEndpoint;
+
+  if (args.action === "client_credentials") {
+    if (!tokenEndpoint) throw new ToolError("tokenEndpoint required (not known for this provider)", "bad_request");
+    if (!args.clientSecret) throw new ToolError("clientSecret is required for the client_credentials grant", "bad_request");
+    const tokens = await requestClientCredentialsToken(tokenEndpoint, {
+      clientId: args.clientId, clientSecret: args.clientSecret, scopes: args.scopes,
+    });
+    const result = await storeOAuthTokens({
+      orgId: ctx.agent.orgId, workspaceId: ctx.workspaceId, provider: args.provider,
+      name: args.name ?? `${args.provider} oauth (client_credentials)`, tokens,
+      endpoints: { tokenEndpoint }, introducingAgentId: ctx.agent.id,
+    });
+    return { status: "stored", credentialId: result.credential.id, created: result.created };
+  }
+
+  if (args.action === "device_start") {
+    const deviceAuthorizationEndpoint = args.deviceAuthorizationEndpoint ?? adapter?.oauth?.authorizationEndpoint;
+    if (!deviceAuthorizationEndpoint || !tokenEndpoint) throw new ToolError("deviceAuthorizationEndpoint/tokenEndpoint required (not known for this provider)", "bad_request");
+    const auth = await requestDeviceAuthorization(deviceAuthorizationEndpoint, { clientId: args.clientId, scopes: args.scopes ?? [] });
+    pendingDeviceFlows.set(auth.device_code, {
+      clientId: args.clientId, clientSecret: args.clientSecret, provider: args.provider, tokenEndpoint,
+      refreshEndpoint: args.refreshEndpoint, name: args.name,
+      orgId: ctx.agent.orgId, workspaceId: ctx.workspaceId, introducingAgentId: ctx.agent.id,
+    });
+    return {
+      status: "device_authorization_created", deviceCode: auth.device_code, userCode: auth.user_code,
+      verificationUri: auth.verification_uri, verificationUriComplete: auth.verification_uri_complete,
+      expiresIn: auth.expires_in, pollIntervalSeconds: auth.interval ?? 5,
+    };
+  }
+
+  if (args.action === "device_poll") {
+    if (!args.deviceCode) throw new ToolError("deviceCode is required", "bad_request");
+    const pending = pendingDeviceFlows.get(args.deviceCode);
+    if (!pending) throw new ToolError("unknown or expired device code", "invalid_state");
+    try {
+      const tokens = await pollDeviceToken(pending.tokenEndpoint, { deviceCode: args.deviceCode, clientId: pending.clientId, clientSecret: pending.clientSecret });
+      pendingDeviceFlows.delete(args.deviceCode);
+      const result = await storeOAuthTokens({
+        orgId: pending.orgId, workspaceId: pending.workspaceId, provider: pending.provider,
+        name: pending.name ?? `${pending.provider} oauth (device)`, tokens,
+        endpoints: { tokenEndpoint: pending.tokenEndpoint, refreshEndpoint: pending.refreshEndpoint },
+        introducingAgentId: pending.introducingAgentId,
+      });
+      return { status: "stored", credentialId: result.credential.id, created: result.created };
+    } catch (err) {
+      if (err instanceof DeviceAuthorizationPendingError) {
+        return { status: "pending", message: "user has not yet approved the device code; poll again after the interval" };
+      }
+      pendingDeviceFlows.delete(args.deviceCode);
+      throw new ToolError(err instanceof Error ? err.message : String(err), "device_flow_failed");
+    }
+  }
+
+  // action === "start" | "complete": authorization-code + PKCE
+  const authorizationEndpoint = args.authorizationEndpoint ?? adapter?.oauth?.authorizationEndpoint;
   if (!authorizationEndpoint || !tokenEndpoint) throw new ToolError("authorizationEndpoint/tokenEndpoint required (not known for this provider)", "bad_request");
 
   if (args.action === "start") {
+    if (!args.redirectUri) throw new ToolError("redirectUri is required to start the authorization-code flow", "bad_request");
     const result = buildAuthorizationUrl({
       authorizationEndpoint, tokenEndpoint, clientId: args.clientId, redirectUri: args.redirectUri, scopes: args.scopes ?? [],
     });
@@ -401,8 +487,12 @@ export async function toolOAuthRefresh(ctx: AgentContext, args: { credentialId: 
   await requirePolicy(ctx, "oauth_refresh", cred);
   const tokenEndpoint = cred.metadata["tokenEndpoint"]?.value as string | undefined;
   const refreshEndpoint = (cred.metadata["refreshEndpoint"]?.value as string | undefined) ?? tokenEndpoint;
+  // authorizationEndpoint is purely informational provenance for this
+  // credential (not used in the refresh HTTP call itself), so its absence
+  // — expected for tokens issued via the device or client_credentials
+  // grants — doesn't block a refresh.
   const authorizationEndpoint = cred.metadata["authEndpoint"]?.value as string | undefined;
-  if (!tokenEndpoint || !refreshEndpoint || !authorizationEndpoint) throw new ToolError("credential is missing OAuth endpoint metadata required to refresh", "missing_metadata");
+  if (!tokenEndpoint || !refreshEndpoint) throw new ToolError("credential is missing OAuth endpoint metadata required to refresh", "missing_metadata");
 
   const { secretValue } = await revealSecretForBrokeredUse(args.credentialId);
   const parsed = JSON.parse(secretValue) as { refresh_token?: string };

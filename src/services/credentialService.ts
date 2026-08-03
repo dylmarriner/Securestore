@@ -602,6 +602,64 @@ export async function shareCredential(
   });
 }
 
+export interface TransferOwnershipInput {
+  ownerScope: OwnerScope;
+  ownerUserId?: string | null;
+  ownerAgentId?: string | null;
+  /** Moving a credential into a different workspace within the same org; omit to keep the current workspace. */
+  workspaceId?: string | null;
+}
+
+/**
+ * Reassigns who owns/is accountable for a credential — distinct from
+ * `shareCredential`, which changes *visibility* without changing
+ * ownership. Callers are responsible for the authorization decision
+ * (current-owner-or-admin, checked by the calling tool handler); this
+ * function's job is the atomic update + audit + event.
+ */
+export async function transferOwnership(
+  credentialId: string,
+  actorAgentId: string,
+  transfer: TransferOwnershipInput,
+): Promise<CredentialRecord> {
+  return withTransaction(async (client) => {
+    const before = await loadCredential(client, credentialId);
+    if (!before) throw new Error("credential not found");
+
+    if (transfer.workspaceId) {
+      const { rows } = await client.query(`SELECT 1 FROM workspaces WHERE id = $1 AND org_id = $2`, [transfer.workspaceId, before.orgId]);
+      if (rows.length === 0) throw new Error(`workspace ${transfer.workspaceId} does not belong to this credential's org`);
+    }
+
+    await client.query(
+      `UPDATE credentials
+       SET owner_scope = $1, owner_user_id = $2, owner_agent_id = $3,
+           workspace_id = COALESCE($4, workspace_id), updated_at = now()
+       WHERE id = $5`,
+      [transfer.ownerScope, transfer.ownerUserId ?? null, transfer.ownerAgentId ?? null, transfer.workspaceId ?? null, credentialId],
+    );
+    const after = (await loadCredential(client, credentialId))!;
+
+    await recordAudit(client, {
+      orgId: after.orgId,
+      agentId: actorAgentId, workspaceId: after.workspaceId, credentialId, provider: after.provider,
+      operation: "credential_ownership_transfer", accessMode: "direct", policyDecision: "allow", result: "success",
+      details: {
+        from: { ownerScope: before.ownerScope, ownerUserId: before.ownerUserId, ownerAgentId: before.ownerAgentId, workspaceId: before.workspaceId },
+        to: { ownerScope: after.ownerScope, ownerUserId: after.ownerUserId, ownerAgentId: after.ownerAgentId, workspaceId: after.workspaceId },
+      },
+    });
+    // Reuses credential.shared — the fixed event vocabulary has no dedicated
+    // ownership-transfer type, and an ownership change is, functionally,
+    // also a change to who can access the credential.
+    await eventBus.publish(client, "credential.shared", {
+      orgId: after.orgId, workspaceId: after.workspaceId, credentialId, agentId: actorAgentId,
+      payload: { action: "ownership_transfer", ownerScope: after.ownerScope },
+    });
+    return after;
+  });
+}
+
 function rowToCredential(row: any): CredentialRecord {
   return {
     id: row.id,

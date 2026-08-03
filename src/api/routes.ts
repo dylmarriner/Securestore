@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { requireAgent } from "./auth.js";
 import { ToolError, toolSecretGet, toolSecretFind, toolSecretList, toolSecretMetadata, toolSecretStore,
   toolSecretStoreDetected, toolSecretUpdate, toolSecretEnrich, toolSecretRotate, toolSecretRevoke,
-  toolSecretDelete, toolSecretClaim, toolSecretShare, toolCredentialExecute, toolCredentialValidate,
+  toolSecretDelete, toolSecretClaim, toolSecretShare, toolSecretTransferOwnership, toolCredentialExecute, toolCredentialValidate,
   toolCredentialProxySessionCreate, toolCredentialTemporaryIssue, toolOAuthAuthorize, toolOAuthRefresh,
   toolPolicyCheck, toolApprovalRequest, toolAuditQuery, toolAgentRegister, toolAgentSessionList,
   toolCredentialEventSubscribe } from "../mcp/toolHandlers.js";
@@ -52,6 +52,7 @@ export function registerRestRoutes(app: FastifyInstance): void {
   app.delete("/v1/secrets/:credentialId", handle(toolSecretDelete));
   app.post("/v1/secrets/:credentialId/claim", handle(toolSecretClaim));
   app.post("/v1/secrets/:credentialId/share", handle(toolSecretShare));
+  app.post("/v1/secrets/:credentialId/transfer-ownership", handle(toolSecretTransferOwnership));
 
   app.post("/v1/credentials/execute", handle(toolCredentialExecute));
   app.post("/v1/credentials/:credentialId/validate", handle(toolCredentialValidate));
