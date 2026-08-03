@@ -2,7 +2,9 @@ import type { FastifyInstance } from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { randomUUID } from "node:crypto";
-import { authenticateApiKey, openSession } from "../services/agentService.js";
+import type { TLSSocket } from "node:tls";
+import { openSession } from "../services/agentService.js";
+import { resolveAgentIdentity } from "../auth/resolveAgent.js";
 import { registerSecureStoreTools } from "./registerTools.js";
 import type { AgentContext } from "./context.js";
 
@@ -19,12 +21,6 @@ interface SessionEntry {
 // multi-replica deployment. Session bootstrap itself (agent auth, workspace
 // resolution, audit) is stateless and safe to load-balance per-request.
 const sessions = new Map<string, SessionEntry>();
-
-function extractApiKey(authHeader: string | string[] | undefined): string | undefined {
-  const header = Array.isArray(authHeader) ? authHeader[0] : authHeader;
-  if (!header?.startsWith("Bearer ")) return undefined;
-  return header.slice("Bearer ".length);
-}
 
 /**
  * Mounts the remote/authenticated-HTTPS MCP transport used by Claude web,
@@ -58,16 +54,15 @@ export function registerMcpHttpRoutes(app: FastifyInstance): void {
       return;
     }
 
-    const apiKey = extractApiKey(request.headers.authorization);
-    if (!apiKey) {
-      reply.code(401).send({ error: "missing Authorization: Bearer <SecureStore agent API key>" });
+    const identity = await resolveAgentIdentity({
+      socket: request.raw.socket as TLSSocket,
+      authorizationHeader: request.headers.authorization,
+    });
+    if (!identity) {
+      reply.code(401).send({ error: "no valid credential presented (mTLS client certificate, Bearer <SecureStore API key>, or Bearer <OIDC token>)" });
       return;
     }
-    const agent = await authenticateApiKey(apiKey);
-    if (!agent) {
-      reply.code(401).send({ error: "invalid or revoked SecureStore agent API key" });
-      return;
-    }
+    const { agent } = identity;
 
     const workspaceId = (request.headers["x-securestore-workspace-id"] as string | undefined) ?? null;
     const sourceNetwork = request.ip;

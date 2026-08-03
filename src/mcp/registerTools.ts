@@ -133,7 +133,9 @@ export function registerSecureStoreTools(server: McpServer, ctx: AgentContext): 
   server.tool("agent_register", "Register a new agent identity (requires admin capability).",
     {
       name: z.string(), agentType: z.string(), platform: z.string().optional(), version: z.string().optional(),
-      authMethod: z.string().optional(), allowedTransports: z.array(z.string()).optional(), allowedTools: z.array(z.string()).optional(),
+      authMethod: z.string().optional(),
+      authIdentifier: z.string().optional().describe("Required for authMethod 'oidc' (expected sub claim) or 'mtls' (client cert SHA-256 fingerprint)"),
+      allowedTransports: z.array(z.string()).optional(), allowedTools: z.array(z.string()).optional(),
       allowedNamespaces: z.array(z.string()).optional(), allowedProviders: z.array(z.string()).optional(), allowedOperations: z.array(z.string()).optional(),
       rawSecretAccess: z.boolean().optional(), autoIngestionPermission: z.boolean().optional(), metadataEnrichmentPermission: z.boolean().optional(),
       rotationPermission: z.boolean().optional(), revocationPermission: z.boolean().optional(),

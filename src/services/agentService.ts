@@ -14,6 +14,8 @@ export interface RegisterAgentInput {
   ownerUserId?: string;
   authMethod?: string;
   publicKey?: string;
+  /** Required when authMethod is 'oidc' (expected `sub` claim) or 'mtls' (client cert SHA-256 fingerprint). */
+  authIdentifier?: string;
   allowedTransports?: string[];
   allowedTools?: string[];
   allowedNamespaces?: string[];
@@ -32,15 +34,15 @@ export async function registerAgent(input: RegisterAgentInput): Promise<{ agent:
   return withTransaction(async (client) => {
     const { rows } = await client.query(
       `INSERT INTO agents (
-         org_id, name, agent_type, platform, version, owner_user_id, auth_method, public_key,
+         org_id, name, agent_type, platform, version, owner_user_id, auth_method, public_key, auth_identifier,
          allowed_transports, allowed_tools, allowed_namespaces, allowed_providers, allowed_operations,
          raw_secret_access, auto_ingestion_permission, metadata_enrichment_permission,
          rotation_permission, revocation_permission, risk_classification
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
        RETURNING *`,
       [
         input.orgId, input.name, input.agentType, input.platform ?? null, input.version ?? null,
-        input.ownerUserId ?? null, input.authMethod ?? "api_key", input.publicKey ?? null,
+        input.ownerUserId ?? null, input.authMethod ?? "api_key", input.publicKey ?? null, input.authIdentifier ?? null,
         input.allowedTransports ?? [], input.allowedTools ?? [], input.allowedNamespaces ?? [],
         input.allowedProviders ?? [], input.allowedOperations ?? [],
         input.rawSecretAccess ?? false, input.autoIngestionPermission ?? true,
@@ -88,6 +90,24 @@ export async function authenticateApiKey(rawKey: string): Promise<AgentRecord | 
        AND (k.expires_at IS NULL OR k.expires_at > now())
        AND a.revoked = false`,
     [hash],
+  );
+  if (rows.length === 0) return null;
+  await pool.query(`UPDATE agents SET last_connected_at = now() WHERE id = $1`, [rows[0].id]);
+  return rowToAgent(rows[0]);
+}
+
+/**
+ * Looks up an agent by (auth_method, auth_identifier) — the generic
+ * linkage used by every non-API-key auth strategy (OIDC subject claim,
+ * mTLS certificate fingerprint). The strategy-specific verification
+ * (JWT signature/issuer/audience, TLS chain validation) happens before
+ * this is called; this function only does the identity-to-agent mapping
+ * and the same revoked/last-connected bookkeeping as authenticateApiKey.
+ */
+export async function authenticateByIdentifier(authMethod: string, identifier: string): Promise<AgentRecord | null> {
+  const { rows } = await pool.query(
+    `SELECT * FROM agents WHERE auth_method = $1 AND auth_identifier = $2 AND revoked = false`,
+    [authMethod, identifier],
   );
   if (rows.length === 0) return null;
   await pool.query(`UPDATE agents SET last_connected_at = now() WHERE id = $1`, [rows[0].id]);

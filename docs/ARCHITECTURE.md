@@ -198,6 +198,40 @@ direct credential-id guessing, listing, audit querying, and agent-session
 lookups) rather than by mocked unit tests alone — see the isolation
 section of the test plan in the PR history for this change.
 
+**Agent authentication strategies.** `src/auth/resolveAgent.ts` is the
+single identity-resolution path shared by the REST middleware and the MCP
+HTTP transport, tried in order: mTLS client certificate, SecureStore API
+key, OIDC bearer token. All three ultimately resolve to the same
+`AgentRecord`, so everything downstream (policy, isolation, audit) is
+identical regardless of how the agent authenticated.
+
+- **mTLS** (`src/auth/mtls.ts`): active once `SECURESTORE_TLS_CERT_PATH`/
+  `KEY_PATH`/`CA_PATH` are all set, which also switches the Fastify
+  listener from HTTP to HTTPS with `requestCert: true` (`src/server.ts`).
+  Node's own TLS handshake does the chain validation against the
+  configured CA; SecureStore only trusts `socket.authorized === true` and
+  then maps the certificate's SHA-256 fingerprint to
+  `agents.auth_identifier` (`auth_method = 'mtls'`).
+  `SECURESTORE_MTLS_REQUIRE=1` rejects any connection that doesn't present
+  a valid certificate at the TLS layer; unset, a client without a
+  certificate can still connect and fall back to API-key/OIDC auth over
+  the same HTTPS listener.
+- **OIDC** (`src/auth/oidc.ts`): active once `SECURESTORE_OIDC_ISSUER`/
+  `JWKS_URI`/`AUDIENCE` are set. A bearer token that doesn't match a known
+  API key is verified via `jose`'s remote-JWKS signature/issuer/audience/
+  expiry check (not the structural-only inspection `src/detectors/jwt.ts`
+  uses for credential-detection heuristics — this one actually verifies
+  the signature), then the token's `sub` claim is matched against
+  `agents.auth_identifier` (`auth_method = 'oidc'`).
+
+Both were verified live in this session (self-signed CA/server/client
+certs via openssl for mTLS; a local JWKS server and `jose`-signed JWTs for
+OIDC): a request presenting only a valid client certificate and no bearer
+token authenticates and resolves to the registered mTLS agent, one without
+a certificate is rejected; a correctly-signed OIDC token with the right
+issuer/audience/subject authenticates, while a wrong-audience or garbage
+token is rejected.
+
 ## 7. Policy engine
 
 `src/policy/engine.ts` implements deny-overrides ABAC: policies specify
@@ -348,7 +382,8 @@ current owner or an admin-capable agent, distinct from `secret_share`
 | Area | Current state | Production seam |
 |---|---|---|
 | KMS/HSM | `LocalKeyProvider` (env-var-derived key) | Implement `KeyProvider` (`src/crypto/kms.ts`) against AWS KMS / GCP KMS / Vault Transit / PKCS#11 |
-| mTLS, OIDC, workload identity, passkeys, hardware-backed client keys | `agents.auth_method` column + API-key auth implemented; other methods are schema-ready but not wired | Add an auth strategy per method in `src/api/auth.ts` / `src/mcp/httpServer.ts`; agent identity model already carries `public_key`, `auth_method` |
+| mTLS, OIDC | Implemented — see §6a below | — |
+| Workload identity, passkeys, hardware-backed client keys | `agents.auth_method`/`auth_identifier` columns are generic enough to carry these too, but no verification strategy is wired for them yet | Add a strategy alongside mTLS/OIDC in `src/auth/resolveAgent.ts`; the agent identity model doesn't need to change |
 | gRPC | Not implemented | Tool handlers in `toolHandlers.ts` are already transport-agnostic; add a `.proto` + server wrapping the same functions, same pattern as the REST mirror |
 | Distributed rate limiting | Implemented: `RedisRateLimiter` (`redisRateLimiter.ts`, atomic Lua INCR+PEXPIRE fixed window), auto-selected over the in-memory default when `REDIS_URL` is set | Point `REDIS_URL` at a Redis instance; no code change needed |
 | Proxy/temporary session store | Implemented: `RedisProxySessionStore` (`redisProxySessionStore.ts`, atomic Lua HINCRBY+conditional DEL, TTL via Redis key expiry), auto-selected over the in-memory default when `REDIS_URL` is set | Point `REDIS_URL` at a Redis instance; no code change needed |

@@ -155,3 +155,9 @@ npm run build    # tsc typecheck + compile
 - `POST /v1/bootstrap` (creates the very first admin agent) only works when
   `SECURESTORE_ADMIN_BOOTSTRAP_TOKEN` is set and supplied; unset it after
   initial setup.
+- Beyond API keys, agents can authenticate via mTLS client certificate or
+  an OIDC bearer token — set `SECURESTORE_TLS_CERT_PATH`/`KEY_PATH`/
+  `CA_PATH` (mTLS) and/or `SECURESTORE_OIDC_ISSUER`/`JWKS_URI`/`AUDIENCE`
+  (OIDC), then register the agent with `authMethod` and `authIdentifier`
+  (client cert SHA-256 fingerprint, or the OIDC token's `sub` claim). See
+  `src/auth/resolveAgent.ts`.
