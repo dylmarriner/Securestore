@@ -235,12 +235,15 @@ contract:
 
 1. **Detect** — `src/detectors/index.ts` runs provider token-prefix
    patterns (`patterns.ts`, GitHub/GitLab/OpenAI/Anthropic/Slack/AWS/npm/
-   Stripe/etc.), strips Authorization-header wrappers, parses DB connection
-   strings, inspects JWT structure (claims only — never signature
-   verification, which stays inside the relevant adapter's `validate()`),
-   and applies env-var-name heuristics — all with confidence scoring.
-   Operators can register additional `TokenPattern`s for internal/custom
-   credential types.
+   Stripe/etc.), recognizes PEM-armored blocks (`pem.ts`: OpenSSH/RSA/EC/
+   DSA private keys, PKCS#8/PGP signing keys, X.509 certificates — checked
+   before the single-line patterns since they're multi-line and
+   self-describing via their armor header), strips Authorization-header
+   wrappers, parses DB connection strings, inspects JWT structure (claims
+   only — never signature verification, which stays inside the relevant
+   adapter's `validate()`), and applies env-var-name heuristics — all with
+   confidence scoring. Operators can register additional `TokenPattern`s
+   for internal/custom credential types.
 2. **Dedup** — delegated to `storeCredential`'s fingerprint lookup (§4/§5).
 3. **Identify provider/type** — the detector's best-confidence match, or
    `unknown`/`text` with `status: "unresolved"` if nothing matched, so a
