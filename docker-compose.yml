@@ -17,6 +17,16 @@ services:
       timeout: 5s
       retries: 10
 
+  # Optional: only needed when scaling app to more than one replica and you
+  # want exact (not per-replica-approximate) rate limiting, and proxy/
+  # temporary-issue tokens redeemable against any replica. Set REDIS_URL on
+  # `app` to enable — a single-replica deployment works fine without it.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    profiles: ["redis"]
+
   migrate:
     build: .
     command: ["node", "dist/db/migrate.js"]
@@ -55,6 +65,7 @@ services:
       SECURESTORE_FINGERPRINT_PEPPER: ${SECURESTORE_FINGERPRINT_PEPPER:?set via .env, generate with: openssl rand -base64 32}
       SECURESTORE_APIKEY_PEPPER: ${SECURESTORE_APIKEY_PEPPER:?set via .env, generate with: openssl rand -base64 32}
       SECURESTORE_ADMIN_BOOTSTRAP_TOKEN: ${SECURESTORE_ADMIN_BOOTSTRAP_TOKEN:-}
+      REDIS_URL: ${REDIS_URL:-}
     depends_on:
       postgres:
         condition: service_healthy

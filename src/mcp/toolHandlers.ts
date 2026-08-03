@@ -264,7 +264,7 @@ export async function toolCredentialExecute(ctx: AgentContext, args: {
   let credentialId = args.credentialId;
   let cred: NonNullable<Awaited<ReturnType<typeof getCredential>>>;
   if (args.proxyToken) {
-    const session = proxySessionStore.redeem(args.proxyToken);
+    const session = await proxySessionStore.redeem(args.proxyToken);
     if (!session) throw new ToolError("proxy token invalid or expired", "invalid_proxy_token");
     // A proxy/temporary token is scoped to the agent it was issued to at
     // creation time (which already passed visibility + policy checks) —
@@ -329,7 +329,7 @@ export async function toolCredentialProxySessionCreate(ctx: AgentContext, args: 
   const cred = await loadVisibleCredential(ctx, args.credentialId);
   const decision = await requirePolicy(ctx, "credential_proxy_session_create", cred);
   const ttl = Math.min(args.ttlSeconds ?? 300, decision.maxSessionSeconds ?? 3600);
-  const session = proxySessionStore.create({
+  const session = await proxySessionStore.create({
     credentialId: cred.id, agentId: ctx.agent.id, workspaceId: ctx.workspaceId,
     usesRemaining: args.maxUses ?? decision.maxRetrievalCount ?? 10, mode: "proxy", ttlSeconds: ttl,
   });
@@ -340,7 +340,7 @@ export async function toolCredentialTemporaryIssue(ctx: AgentContext, args: { cr
   const cred = await loadVisibleCredential(ctx, args.credentialId);
   await requirePolicy(ctx, "credential_temporary_issue", cred);
   const ttl = Math.min(args.ttlSeconds ?? 60, 900);
-  const session = proxySessionStore.create({
+  const session = await proxySessionStore.create({
     credentialId: cred.id, agentId: ctx.agent.id, workspaceId: ctx.workspaceId,
     usesRemaining: args.maxUses ?? 1, mode: "temporary", ttlSeconds: ttl,
   });

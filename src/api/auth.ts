@@ -1,5 +1,5 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
-import { authenticateApiKey, openSession, rateLimiter } from "../services/agentService.js";
+import { authenticateApiKey, openSession, getRateLimiter } from "../services/agentService.js";
 import type { AgentContext } from "../mcp/context.js";
 
 declare module "fastify" {
@@ -29,7 +29,7 @@ export async function requireAgent(request: FastifyRequest, reply: FastifyReply)
     reply.code(401).send({ error: "invalid or revoked SecureStore agent API key" });
     return reply;
   }
-  if (!rateLimiter.tryConsume(agent.id)) {
+  if (!(await getRateLimiter().tryConsume(agent.id))) {
     reply.code(429).send({ error: "rate limit exceeded" });
     return reply;
   }

@@ -329,7 +329,12 @@ signing-key detection; scheduled expiry-sweep and health-revalidation jobs
 (`src/services/scheduledJobs.ts`) coordinated across replicas via Postgres
 advisory locks rather than a separate leader-election system; a CI
 pipeline (build, typecheck, unit tests, production-dependency audit, and a
-live Postgres-backed end-to-end smoke test) gating merges to `main`.
+live Postgres-backed end-to-end smoke test) gating merges to `main`; optional
+Redis-backed rate limiting and proxy/temporary-issue session storage for
+exact (not per-replica-approximate) behavior under horizontal scale-out,
+auto-selected when `REDIS_URL` is set (verified live against a local
+Redis: window-limited rate limiting, atomic multi-use decrement down to
+exhaustion, and TTL-based expiry all behave correctly).
 
 **Extension points, deliberately not bundled**:
 
@@ -338,12 +343,12 @@ live Postgres-backed end-to-end smoke test) gating merges to `main`.
 | KMS/HSM | `LocalKeyProvider` (env-var-derived key) | Implement `KeyProvider` (`src/crypto/kms.ts`) against AWS KMS / GCP KMS / Vault Transit / PKCS#11 |
 | mTLS, OIDC, workload identity, passkeys, hardware-backed client keys | `agents.auth_method` column + API-key auth implemented; other methods are schema-ready but not wired | Add an auth strategy per method in `src/api/auth.ts` / `src/mcp/httpServer.ts`; agent identity model already carries `public_key`, `auth_method` |
 | gRPC | Not implemented | Tool handlers in `toolHandlers.ts` are already transport-agnostic; add a `.proto` + server wrapping the same functions, same pattern as the REST mirror |
-| Distributed rate limiting | In-memory per-process token bucket | Swap `InMemoryRateLimiter` (`agentService.ts`) for Redis INCR/PEXPIRE or a Lua token-bucket, same interface |
-| Proxy/temporary session store | In-memory per-process | Swap `ProxySessionStore` for Redis SETEX, same interface |
-| Distributed locking beyond row-level `FOR UPDATE`/unique constraints | Not needed for current operations (Postgres transactions + unique constraints are sufficient for the write patterns here) | Add Postgres advisory locks or a lease table if a future operation needs cross-statement, cross-transaction mutual exclusion |
+| Distributed rate limiting | Implemented: `RedisRateLimiter` (`redisRateLimiter.ts`, atomic Lua INCR+PEXPIRE fixed window), auto-selected over the in-memory default when `REDIS_URL` is set | Point `REDIS_URL` at a Redis instance; no code change needed |
+| Proxy/temporary session store | Implemented: `RedisProxySessionStore` (`redisProxySessionStore.ts`, atomic Lua HINCRBY+conditional DEL, TTL via Redis key expiry), auto-selected over the in-memory default when `REDIS_URL` is set | Point `REDIS_URL` at a Redis instance; no code change needed |
+| Distributed locking beyond row-level `FOR UPDATE`/unique constraints | Implemented for the one case that needed it: `scheduledJobs.ts` uses `pg_try_advisory_lock` so only one replica runs the expiry-sweep/health-revalidation tick | Add another advisory lock or a lease table if a future operation needs similar cross-statement, cross-transaction mutual exclusion |
 | Policy DSL | Custom ABAC engine (JSON documents in `policies` table) | Swap `evaluatePolicy()` internals for an OPA/Rego sidecar call if org standardizes on Rego |
 | Backup/DR | Postgres is the single source of truth; standard `pg_dump`/WAL-archiving/replica promotion applies | Document and automate per the operator's existing Postgres HA tooling (Patroni, RDS Multi-AZ, etc.) — this is intentionally left to infra, not reinvented here |
-| Leader election | Not used — no operation in this design requires a singleton leader (all writes are per-row atomic transactions) | If a future background job (e.g. expiry-sweep) needs exactly-one-runner semantics, use a Postgres advisory lock, not a new coordination system |
+| Leader election | Not used beyond the advisory-lock pattern above — no operation in this design requires a persistent, elected leader | If a future job needs true leader semantics (not just "one winner per tick"), that's a different primitive (e.g. a lease row with a heartbeat) than what's here |
 | Approval UI | `approval_request` tool/endpoint + `approval_requests` table | Wire a human-facing admin UI/Slack bot that calls `POST /v1/approvals` with `action:"decide"` |
 
 None of these are silently stubbed-and-insecure — each either fails loudly

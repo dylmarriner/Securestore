@@ -1,6 +1,8 @@
 import { pool, withTransaction } from "../db/pool.js";
 import { generateApiKey, hashApiKey } from "../crypto/fingerprint.js";
 import { config } from "../config.js";
+import { getRedisClient, isRedisConfigured } from "./redisClient.js";
+import { RedisRateLimiter } from "./redisRateLimiter.js";
 import type { AgentRecord } from "./types.js";
 
 export interface RegisterAgentInput {
@@ -180,20 +182,23 @@ function rowToAgent(row: any): AgentRecord {
   };
 }
 
+/** Per-agent rate limiting. Async so a Redis-backed implementation is a drop-in swap — see src/services/redisRateLimiter.ts. */
+export interface RateLimiter {
+  tryConsume(agentId: string): Promise<boolean>;
+}
+
 /**
- * Per-agent token-bucket rate limiting. In-memory, per-process: correct for
- * a single instance, and approximately correct (each replica enforces its
- * own share of the limit) under horizontal scale-out. For an exact global
- * limit across a replica fleet, back this with Redis (INCR + PEXPIRE /
- * a Lua token-bucket script) instead — the RateLimiter interface below is
- * the seam to swap that in without touching call sites.
+ * In-memory token-bucket rate limiting. Correct for a single instance, and
+ * approximately correct (each replica enforces its own share of the limit)
+ * under horizontal scale-out. This is the default; set REDIS_URL to switch
+ * to RedisRateLimiter for an exact global limit across a replica fleet.
  */
-class InMemoryRateLimiter {
+class InMemoryRateLimiter implements RateLimiter {
   private readonly buckets = new Map<string, { tokens: number; lastRefill: number }>();
 
   constructor(private readonly perMinute: number) {}
 
-  tryConsume(agentId: string): boolean {
+  async tryConsume(agentId: string): Promise<boolean> {
     const now = Date.now();
     const bucket = this.buckets.get(agentId) ?? { tokens: this.perMinute, lastRefill: now };
     const elapsedMinutes = (now - bucket.lastRefill) / 60_000;
@@ -209,4 +214,14 @@ class InMemoryRateLimiter {
   }
 }
 
-export const rateLimiter = new InMemoryRateLimiter(config.rateLimit.defaultPerMinute);
+let rateLimiterInstance: RateLimiter | undefined;
+
+export function getRateLimiter(): RateLimiter {
+  if (rateLimiterInstance) return rateLimiterInstance;
+  if (isRedisConfigured()) {
+    rateLimiterInstance = new RedisRateLimiter(getRedisClient()!, config.rateLimit.defaultPerMinute);
+  } else {
+    rateLimiterInstance = new InMemoryRateLimiter(config.rateLimit.defaultPerMinute);
+  }
+  return rateLimiterInstance;
+}

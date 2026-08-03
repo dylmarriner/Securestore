@@ -37,4 +37,11 @@ export const config = {
   rateLimit: {
     defaultPerMinute: Number(process.env.SECURESTORE_DEFAULT_RATE_PER_MIN ?? 120),
   },
+  // Optional: when set, rate limiting and proxy/temporary-issue sessions
+  // are backed by Redis instead of per-process memory, giving exact
+  // (not per-replica-approximate) behavior across a horizontally scaled
+  // deployment. See src/services/redisClient.ts.
+  redis: {
+    url: process.env.REDIS_URL,
+  },
 };
